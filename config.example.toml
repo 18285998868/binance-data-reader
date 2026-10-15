@@ -1,0 +1,15 @@
+# 配置说明: 全部字段以小写字母开头
+#
+# 目录约定 (重要): dir 是数据**根目录**, 程序按数据源自动追加子路径,
+#   binance:   {dir}/binance/data/um/daily/klines/{symbol}/{timeframe}/*.zip (zip 内含 {symbol}-{tf}-{YYYY-MM-DD}.csv, Binance 官方 12 列取前 6)
+#   dukascopy: {dir}/dukascopy/{symbol}/{YYYY}[/{MM}[/{DD}]]/{BID|ASK}_candles_{min_1|hour_1|day_1}.bi5 (官方镜像布局, LZMA 压缩, 每记录 24 字节大端)
+# 因此不要把子路径写进 dir, 否则会找不到目录:
+#   错误: dir = "/data/nutilustrader/data/binance/data/um/daily/klines"
+#   正确: dir = "/data/nutilustrader/data"
+#
+type = "binance" # 数据源类型, 必填, 可选参数: "binance" | "dukascopy"
+dir = "/data/nutilustrader/data" # K线数据根目录, 必填
+symbol = ["BTCUSDT"] # 品种列表, 必填
+timeframes = ["1d"] # 时间帧列表, 必填; binance: "1m"~"1d", dukascopy: "M1"/"H1"/"D1"
+# start_date = "2024-01-01" # 数据起始日期, 可选, 默认值: 无(全部数据), 可选参数: YYYY-MM-DD
+# end_date = "2024-12-31" # 数据结束日期, 可选, 默认值: 无(全部数据), 可选参数: YYYY-MM-DD
