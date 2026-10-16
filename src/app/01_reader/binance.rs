@@ -2,11 +2,13 @@ use std::io::Read;
 use std::path::Path;
 use std::time::Instant;
 
+use chrono::NaiveDate;
 use csv::StringRecord;
 use rayon::prelude::*;
 
 use crate::app::Record;
 use crate::error::{ReaderError, Result};
+use crate::types::{Symbol, Timeframe};
 
 #[cfg(test)]
 use crate::test_helpers::create_test_zip;
@@ -55,14 +57,18 @@ fn extract_date_from_filename(stem: &str) -> Result<Option<&str>> {
     Ok(Some(candidate))
 }
 
-fn should_skip_by_date(date_str: &str, start_date: Option<&str>, end_date: Option<&str>) -> bool {
+fn should_skip_by_date(
+    file_date: NaiveDate,
+    start_date: Option<NaiveDate>,
+    end_date: Option<NaiveDate>,
+) -> bool {
     if let Some(sd) = start_date
-        && date_str < sd
+        && file_date < sd
     {
         return true;
     }
     if let Some(ed) = end_date
-        && date_str > ed
+        && file_date > ed
     {
         return true;
     }
@@ -128,6 +134,12 @@ fn parse_row(row: &StringRecord) -> Result<Record> {
     let low = parse_f64_field(row, 3, "low")?;
     let close = parse_f64_field(row, 4, "close")?;
     let volume = parse_f64_field(row, 5, "volume")?;
+    // 两源统一口径（`super::is_valid_ohlc`）：零价/高低错位即坏行，调用方计数跳过。
+    if !super::is_valid_ohlc(open, high, low, close, volume) {
+        return Err(ReaderError::Parse(format!(
+            "ohlc invalid: open={open} high={high} low={low} close={close} volume={volume}"
+        )));
+    }
     Ok(Record {
         open_time,
         open,
@@ -150,21 +162,31 @@ fn row_snippet(row: &StringRecord, max_chars: usize) -> String {
 
 /// Parses Binance kline CSV data, skipping unparseable rows instead of failing the whole input.
 /// Returns the parsed records plus the rows that were skipped (with their line numbers).
+///
+/// 边界：无换行单行按单行解析；首部空行跳过（只跳行，不丢文件）。
 fn parse_csv_bytes(bytes: &[u8]) -> Result<(Vec<Record>, SkippedRows)> {
-    let newline_pos = match bytes.iter().position(|&b| b == b'\n') {
-        Some(p) => p,
-        None => return Ok((Vec::new(), SkippedRows::default())),
-    };
-    if newline_pos == 0 {
+    // 跳过首部空行：行号基数同步后移，保证 warn 留样行号准确。
+    let mut start = 0;
+    let mut skipped_blank_lines = 0usize;
+    while start < bytes.len() && (bytes[start] == b'\n' || bytes[start] == b'\r') {
+        if bytes[start] == b'\n' {
+            skipped_blank_lines += 1;
+        }
+        start += 1;
+    }
+    if start >= bytes.len() {
         return Ok((Vec::new(), SkippedRows::default()));
     }
+    let rest = &bytes[start..];
 
-    let has_header = has_csv_header(&bytes[..newline_pos]);
-    let data = if has_header {
-        &bytes[newline_pos + 1..]
-    } else {
-        bytes
+    // 无换行：整块即首行（单行文件，无尾换行也解析）。
+    let (first_line, data) = match rest.iter().position(|&b| b == b'\n') {
+        Some(p) => (&rest[..p], &rest[p + 1..]),
+        None => (rest, &rest[rest.len()..]),
     };
+
+    let has_header = has_csv_header(first_line);
+    let data = if has_header { data } else { rest };
 
     let mut rdr = csv::ReaderBuilder::new()
         .has_headers(false)
@@ -173,7 +195,7 @@ fn parse_csv_bytes(bytes: &[u8]) -> Result<(Vec<Record>, SkippedRows)> {
 
     let mut records = Vec::new();
     let mut skipped = SkippedRows::default();
-    let mut row_num = if has_header { 1 } else { 0 };
+    let mut row_num = skipped_blank_lines + usize::from(has_header);
 
     for result in rdr.records() {
         row_num += 1;
@@ -229,22 +251,28 @@ fn load_single_zip(path: &Path) -> Result<(Vec<Record>, usize)> {
 }
 
 /// Scan directory for matching zip files, parse them (in parallel), and merge into sorted Records.
-#[tracing::instrument(skip_all, fields(dir, symbol, timeframe))]
+#[tracing::instrument(skip_all, fields(symbol, timeframe))]
 pub(crate) fn load_pipeline(
-    dir: &str,
-    symbol: &str,
-    timeframe: &str,
-    start_date: Option<&str>,
-    end_date: Option<&str>,
+    dir: impl AsRef<Path>,
+    symbol: &Symbol,
+    timeframe: &Timeframe,
+    start_date: Option<NaiveDate>,
+    end_date: Option<NaiveDate>,
 ) -> Result<Vec<Record>> {
-    let data_dir = Path::new(dir)
+    let dir = dir.as_ref();
+    let data_dir = dir
         .join("binance/data/um/daily/klines")
-        .join(symbol)
-        .join(timeframe);
+        .join(symbol.as_str())
+        .join(timeframe.as_str());
     if !data_dir.exists() {
         return Err(ReaderError::Io(std::io::Error::new(
             std::io::ErrorKind::NotFound,
-            format!("directory not found: {dir}/binance/data/um/daily/klines/{symbol}/{timeframe}"),
+            format!(
+                "directory not found: {}/binance/data/um/daily/klines/{}/{}",
+                dir.display(),
+                symbol,
+                timeframe,
+            ),
         )));
     }
 
@@ -256,48 +284,75 @@ pub(crate) fn load_pipeline(
     let t0 = Instant::now();
 
     let mut paths: Vec<_> = rd
-        .flatten()
-        .map(|entry| entry.path())
+        .filter_map(|entry| match entry {
+            Ok(e) => Some(e.path()),
+            Err(e) => {
+                tracing::warn!("read_dir entry failed: {e}");
+                None
+            }
+        })
         .filter(|path| path.extension().and_then(|s| s.to_str()) == Some("zip"))
         .collect();
 
     paths.par_sort_unstable();
 
-    let parsed: Vec<Option<(Vec<Record>, usize)>> = paths
+    /// 单文件结局：`Loaded` 好行、`Skipped` 意图内跳过（无日期形状/区间外）、
+    /// `Failed` 硬失败（非法日期形状、损坏 zip、无 CSV），计入零容忍收口。
+    enum FileOutcome {
+        Loaded(Vec<Record>, usize),
+        Skipped,
+        Failed(String),
+    }
+
+    let outcomes: Vec<(std::path::PathBuf, FileOutcome)> = paths
         .par_iter()
         .map(|path| {
             let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
             let date_str = match extract_date_from_filename(stem) {
                 Ok(Some(date)) => date,
-                Ok(None) => return None,
+                Ok(None) => {
+                    tracing::debug!("skipped {}: no date in filename", path.display());
+                    return (path.clone(), FileOutcome::Skipped);
+                }
+                Err(e) => return (path.clone(), FileOutcome::Failed(e.to_string())),
+            };
+            let file_date = match NaiveDate::parse_from_str(date_str, "%Y-%m-%d") {
+                Ok(d) => d,
                 Err(e) => {
-                    tracing::warn!("failed to load {}: {e}", path.display());
-                    return None;
+                    return (
+                        path.clone(),
+                        FileOutcome::Failed(format!("invalid date {date_str}: {e}")),
+                    );
                 }
             };
-            if should_skip_by_date(date_str, start_date, end_date) {
-                return None;
+            if should_skip_by_date(file_date, start_date, end_date) {
+                return (path.clone(), FileOutcome::Skipped);
             }
             match load_single_zip(path) {
-                Ok(loaded) => Some(loaded),
-                Err(e) => {
-                    tracing::warn!("failed to load {}: {e}", path.display());
-                    None
-                }
+                Ok((records, skipped)) => (path.clone(), FileOutcome::Loaded(records, skipped)),
+                Err(e) => (path.clone(), FileOutcome::Failed(e.to_string())),
             }
         })
         .collect();
 
     let mut all_records = Vec::new();
+    let mut failed: Vec<String> = Vec::new();
     let mut files_with_skips = 0usize;
     let mut skipped_rows_total = 0usize;
-    for (records, skipped) in parsed.into_iter().flatten() {
-        if skipped > 0 {
-            files_with_skips += 1;
-            skipped_rows_total += skipped;
+    for (path, outcome) in outcomes {
+        match outcome {
+            FileOutcome::Loaded(records, skipped) => {
+                if skipped > 0 {
+                    files_with_skips += 1;
+                    skipped_rows_total += skipped;
+                }
+                all_records.extend(records);
+            }
+            FileOutcome::Skipped => {}
+            FileOutcome::Failed(detail) => failed.push(format!("{}: {detail}", path.display())),
         }
-        all_records.extend(records);
     }
+    super::fail_on_hard_errors("binance", &failed)?;
     if skipped_rows_total > 0 {
         tracing::warn!(
             files = files_with_skips,
@@ -317,6 +372,17 @@ mod tests {
     use tempfile::TempDir;
 
     const HEADER12: &str = "open_time,open,high,low,close,volume,close_time,quote_volume,count,taker_buy_volume,taker_buy_quote_volume,ignore";
+
+    use crate::config::DataSource;
+    fn sym(s: &str) -> Symbol {
+        Symbol::parse(s).unwrap()
+    }
+    fn tf(s: &str) -> Timeframe {
+        Timeframe::parse(DataSource::Binance, s).unwrap()
+    }
+    fn pd(s: &str) -> NaiveDate {
+        NaiveDate::parse_from_str(s, "%Y-%m-%d").unwrap()
+    }
 
     fn write_kline_csv(rows: impl IntoIterator<Item = (i64, f64, f64, f64, f64, f64)>) -> String {
         let mut content = String::new();
@@ -349,13 +415,13 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         setup_dir(tmp.path(), "X", "1m");
 
-        let records = load_pipeline(tmp.path().to_str().unwrap(), "X", "1m", None, None).unwrap();
+        let records = load_pipeline(tmp.path(), &sym("X"), &tf("1m"), None, None).unwrap();
         assert!(records.is_empty());
     }
 
     #[test]
     fn reader_nonexistent_dir_errors() {
-        let result = load_pipeline("/nonexistent/path", "X", "1m", None, None);
+        let result = load_pipeline("/nonexistent/path", &sym("X"), &tf("1m"), None, None);
         assert!(result.is_err());
         match result.unwrap_err() {
             ReaderError::Io(_) => {}
@@ -370,7 +436,7 @@ mod tests {
         let csv = "1578528000000,240.17,240.19,239.62,239.62,439.917,1578528059999,105529.27598,47,1.035,248.53455,0\n";
         create_test_zip(&dir, "X-1m-2024-01-09.zip", csv);
 
-        let records = load_pipeline(tmp.path().to_str().unwrap(), "X", "1m", None, None).unwrap();
+        let records = load_pipeline(tmp.path(), &sym("X"), &tf("1m"), None, None).unwrap();
         assert_eq!(records.len(), 1);
         assert!((records[0].close - 239.62).abs() < 0.001);
     }
@@ -476,10 +542,54 @@ mod tests {
     }
 
     #[test]
+    fn parse_rejects_misaligned_ohlc_and_zero_price() {
+        // 高低错位 / 零价与 dukascopy 同口径跳过并计数。
+        let csv = [
+            "100,10.0,12.0,9.0,11.0,1000.0,0,0,0,0,0,0",
+            "200,10.0,9.0,12.0,11.0,1000.0,0,0,0,0,0,0",
+            "300,0.0,0.0,0.0,0.0,1000.0,0,0,0,0,0,0",
+            "400,10.0,12.0,9.0,13.0,1000.0,0,0,0,0,0,0",
+        ]
+        .join("\n");
+
+        let (records, skipped) = parse_csv_bytes(csv.as_bytes()).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].open_time, 100);
+        assert_eq!(skipped.count, 3);
+    }
+
+    #[test]
     fn parse_with_header_skips_header() {
         let csv = format!("{HEADER12}\n100,10.0,12.0,9.0,11.0,1000.0,0,0,0,0,0,0\n");
         let (records, skipped) = parse_csv_bytes(csv.as_bytes()).unwrap();
         assert_eq!(records.len(), 1);
+        assert_eq!(skipped.count, 0);
+    }
+
+    #[test]
+    fn parse_single_line_without_trailing_newline() {
+        // 单行文件无尾换行：整块即一行，必须解析而非丢文件。
+        let csv = "100,10.0,12.0,9.0,11.0,1000.0,0,0,0,0,0,0";
+        let (records, skipped) = parse_csv_bytes(csv.as_bytes()).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].open_time, 100);
+        assert_eq!(skipped.count, 0);
+    }
+
+    #[test]
+    fn parse_header_only_without_trailing_newline_is_empty() {
+        let (records, skipped) = parse_csv_bytes(HEADER12.as_bytes()).unwrap();
+        assert!(records.is_empty());
+        assert_eq!(skipped.count, 0);
+    }
+
+    #[test]
+    fn parse_leading_blank_lines_skipped() {
+        // 首空行只跳行：好行保留，行号按绝对位置报。
+        let csv = "\n\n100,10.0,12.0,9.0,11.0,1000.0,0,0,0,0,0,0\n";
+        let (records, skipped) = parse_csv_bytes(csv.as_bytes()).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].open_time, 100);
         assert_eq!(skipped.count, 0);
     }
 
@@ -572,7 +682,7 @@ mod tests {
         let csv = write_kline_csv([(base_ts, 10.0, 12.0, 9.0, 11.0, 1000.0)]);
         create_test_zip(&dir, "X-1m-2024-01-01.zip", &csv);
 
-        let records = load_pipeline(tmp.path().to_str().unwrap(), "X", "1m", None, None).unwrap();
+        let records = load_pipeline(tmp.path(), &sym("X"), &tf("1m"), None, None).unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].close, 11.0);
     }
@@ -587,7 +697,7 @@ mod tests {
         create_test_zip(&dir, "X-1m-2024-01-01.zip", &csv1);
         create_test_zip(&dir, "X-1m-2024-01-02.zip", &csv2);
 
-        let records = load_pipeline(tmp.path().to_str().unwrap(), "X", "1m", None, None).unwrap();
+        let records = load_pipeline(tmp.path(), &sym("X"), &tf("1m"), None, None).unwrap();
         assert_eq!(records.len(), 2);
     }
 
@@ -595,13 +705,13 @@ mod tests {
     fn load_pipeline_empty_dir() {
         let tmp = TempDir::new().unwrap();
         setup_dir(tmp.path(), "X", "1m");
-        let records = load_pipeline(tmp.path().to_str().unwrap(), "X", "1m", None, None).unwrap();
+        let records = load_pipeline(tmp.path(), &sym("X"), &tf("1m"), None, None).unwrap();
         assert!(records.is_empty());
     }
 
     #[test]
     fn load_pipeline_nonexistent_dir_errors() {
-        let result = load_pipeline("/nonexistent/path", "X", "1m", None, None);
+        let result = load_pipeline("/nonexistent/path", &sym("X"), &tf("1m"), None, None);
         assert!(result.is_err());
         match result.unwrap_err() {
             ReaderError::Io(_) => {}
@@ -622,11 +732,11 @@ mod tests {
         create_test_zip(&dir, "X-1m-2024-02-01.zip", &csv3);
 
         let records = load_pipeline(
-            tmp.path().to_str().unwrap(),
-            "X",
-            "1m",
-            Some("2024-01-10"),
-            Some("2024-01-20"),
+            tmp.path(),
+            &sym("X"),
+            &tf("1m"),
+            Some(pd("2024-01-10")),
+            Some(pd("2024-01-20")),
         )
         .unwrap();
         assert_eq!(records.len(), 1);
@@ -642,7 +752,7 @@ mod tests {
         create_test_zip(&dir, "X-1d-2024-01-01.zip", &csv1);
         create_test_zip(&dir, "X-1d-2024-01-02.zip", &csv2);
 
-        let records = load_pipeline(tmp.path().to_str().unwrap(), "X", "1d", None, None).unwrap();
+        let records = load_pipeline(tmp.path(), &sym("X"), &tf("1d"), None, None).unwrap();
         assert_eq!(records.len(), 2);
     }
 
@@ -654,10 +764,10 @@ mod tests {
         create_test_zip(&dir, "X-1h-2024-06-01.zip", &csv);
 
         let records = load_pipeline(
-            tmp.path().to_str().unwrap(),
-            "X",
-            "1h",
-            Some("2025-01-01"),
+            tmp.path(),
+            &sym("X"),
+            &tf("1h"),
+            Some(pd("2025-01-01")),
             None,
         )
         .unwrap();
@@ -677,14 +787,14 @@ mod tests {
         let csv_with_header = format!("{HEADER12}\n200,11.0,12.0,10.0,11.5,600.0,0,0,0,0,0,0\n");
         create_test_zip(&dir, "Y-1m-2024-01-02.zip", &csv_with_header);
 
-        let records = load_pipeline(tmp.path().to_str().unwrap(), "Y", "1m", None, None).unwrap();
+        let records = load_pipeline(tmp.path(), &sym("Y"), &tf("1m"), None, None).unwrap();
         assert_eq!(records.len(), 2);
         assert_eq!(records[0].open_time, 100);
         assert_eq!(records[1].open_time, 200);
     }
 
     #[test]
-    fn load_pipeline_corrupt_file_skips_with_warning() {
+    fn load_pipeline_undated_file_skipped() {
         let tmp = TempDir::new().unwrap();
         let dir = setup_dir(tmp.path(), "Z", "1m");
 
@@ -695,7 +805,7 @@ mod tests {
         // corrupt (not a zip)
         std::fs::write(dir.join("corrupt.zip"), b"this is not a zip").unwrap();
 
-        let records = load_pipeline(tmp.path().to_str().unwrap(), "Z", "1m", None, None).unwrap();
+        let records = load_pipeline(tmp.path(), &sym("Z"), &tf("1m"), None, None).unwrap();
         assert_eq!(records.len(), 1);
     }
 
@@ -709,7 +819,7 @@ mod tests {
         create_test_zip(&dir, "S-1m-2024-01-02.zip", &csv1);
         create_test_zip(&dir, "S-1m-2024-01-01.zip", &csv2);
 
-        let records = load_pipeline(tmp.path().to_str().unwrap(), "S", "1m", None, None).unwrap();
+        let records = load_pipeline(tmp.path(), &sym("S"), &tf("1m"), None, None).unwrap();
         assert_eq!(records.len(), 2);
         assert_eq!(records[0].open_time, 100);
         assert_eq!(records[1].open_time, 200);
@@ -726,7 +836,7 @@ mod tests {
         .join("\n");
         create_test_zip(&dir, "B-1m-2024-01-01.zip", &csv);
 
-        let records = load_pipeline(tmp.path().to_str().unwrap(), "B", "1m", None, None).unwrap();
+        let records = load_pipeline(tmp.path(), &sym("B"), &tf("1m"), None, None).unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].open_time, 100);
     }
@@ -738,21 +848,36 @@ mod tests {
         let csv = "1,open,high,low,close,volume,close_time,quote_volume,count,taker_buy_volume,taker_buy_quote_volume,ignore\n100,10.0,12.0,9.0,11.0,1000.0,0,0,0,0,0,0\n";
         create_test_zip(&dir, "C-1m-2024-01-01.zip", csv);
 
-        let records = load_pipeline(tmp.path().to_str().unwrap(), "C", "1m", None, None).unwrap();
+        let records = load_pipeline(tmp.path(), &sym("C"), &tf("1m"), None, None).unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].open_time, 100);
     }
 
     #[test]
-    fn load_pipeline_invalid_date_filename_skipped() {
+    fn load_pipeline_invalid_date_filename_errors() {
+        // 非法日期形状是硬失败（零容忍）：即使有好文件，整批也 Err 并报告。
         let tmp = TempDir::new().unwrap();
         let dir = setup_dir(tmp.path(), "D", "1m");
         let csv = write_kline_csv([(100, 10.0, 12.0, 9.0, 11.0, 1000.0)]);
         create_test_zip(&dir, "D-1m-2024-01-01.zip", &csv);
         create_test_zip(&dir, "D-1m-2024-13-99.zip", &csv);
 
-        let records = load_pipeline(tmp.path().to_str().unwrap(), "D", "1m", None, None).unwrap();
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].open_time, 100);
+        let result = load_pipeline(tmp.path(), &sym("D"), &tf("1m"), None, None);
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("1 file(s) failed"), "unexpected: {msg}");
+        assert!(msg.contains("2024-13-99"), "unexpected: {msg}");
+    }
+
+    #[test]
+    fn load_pipeline_corrupt_dated_file_errors() {
+        let tmp = TempDir::new().unwrap();
+        let dir = setup_dir(tmp.path(), "E", "1m");
+        let csv = write_kline_csv([(100, 10.0, 12.0, 9.0, 11.0, 1000.0)]);
+        create_test_zip(&dir, "E-1m-2024-01-01.zip", &csv);
+        std::fs::write(dir.join("E-1m-2024-01-02.zip"), b"this is not a zip").unwrap();
+
+        let result = load_pipeline(tmp.path(), &sym("E"), &tf("1m"), None, None);
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("1 file(s) failed"), "unexpected: {msg}");
     }
 }

@@ -1,39 +1,21 @@
 //! 加载后清洗: 去重 + 缺口检查(只报不改数).
 //!
 //! - 去重: 输入须已按 `open_time` 排好序, 按时间戳 keep first, 返回去掉条数.
-//! - 缺口: 按 timeframe 期望间隔扫描, 缺段只上报不补价不切段, 下游序列保持
-//!   拼接原样, 报告供研究复核回测结果(缺口横跨会压缩跳空、延迟信号, 见模块注释).
+//! - 缺口: 按 `Timeframe::interval_ms` 扫描, 缺段只上报不补价不切段.
 
 use crate::app::Record;
 use crate::error::{ReaderError, Result};
+use crate::types::{self, Timeframe};
 
 /// 缺口报告留样上限, 与 binance reader 的 `MAX_SKIP_SAMPLES` 同口径.
 const MAX_GAP_SAMPLES: usize = 5;
 
-/// timeframe → 期望 bar 间隔(毫秒). 未知周期返回 `Err`, 调用方降级为跳过检查
-/// (warn), 不阻断加载.
+/// 兼容旧字符串入口：查单一真相源 `types::interval_ms_for`。
+/// 新代码请直接用 `&Timeframe`（构造即带间隔，不会失败）。
+#[allow(dead_code)]
 pub(crate) fn interval_ms_for_timeframe(tf: &str) -> Result<i64> {
-    let ms = match tf {
-        "1m" | "M1" => 60_000,
-        "3m" => 180_000,
-        "5m" => 300_000,
-        "15m" => 900_000,
-        "30m" => 1_800_000,
-        "1h" | "H1" => 3_600_000,
-        "2h" => 7_200_000,
-        "4h" => 14_400_000,
-        "6h" => 21_600_000,
-        "8h" => 28_800_000,
-        "12h" => 43_200_000,
-        "1d" | "D1" => 86_400_000,
-        "1w" => 604_800_000,
-        _ => {
-            return Err(ReaderError::Parse(format!(
-                "unknown timeframe for gap check: {tf:?}"
-            )));
-        }
-    };
-    Ok(ms)
+    types::interval_ms_for(tf)
+        .ok_or_else(|| ReaderError::Parse(format!("unknown timeframe for gap check: {tf:?}")))
 }
 
 /// 缺口段: 缺口前后两根已知 bar 的时间戳.
@@ -47,12 +29,11 @@ pub(crate) struct Gap {
     pub misaligned: bool,
 }
 
-/// 清洗报告: 去重数 + 缺口清单 + 是否跳过缺口检查. 只供日志与复核, 下游序列不变.
+/// 清洗报告: 去重数 + 缺口清单. 只供日志与复核, 下游序列不变.
 #[derive(Debug, Default, Clone)]
 pub(crate) struct CleanReport {
     pub dups_removed: usize,
     pub gaps: Vec<Gap>,
-    pub gap_check_skipped: bool,
 }
 
 /// 去重: 输入须已按 `open_time` 排好序(`retain` 保序, keep first).
@@ -89,21 +70,14 @@ pub(crate) fn find_gaps(records: &[Record], interval_ms: i64) -> Vec<Gap> {
     gaps
 }
 
-/// 一站式清洗: 去重 + 缺口检查. 未知 timeframe 只标记跳过, 不报错.
-pub(crate) fn clean_sorted(records: Vec<Record>, timeframe: &str) -> (Vec<Record>, CleanReport) {
+/// 一站式清洗: 去重 + 缺口检查. `Timeframe` 自带间隔，不再跳过检查.
+pub(crate) fn clean_sorted(
+    records: Vec<Record>,
+    timeframe: &Timeframe,
+) -> (Vec<Record>, CleanReport) {
     let (records, dups_removed) = dedup_sorted(records);
-    let (gaps, gap_check_skipped) = match interval_ms_for_timeframe(timeframe) {
-        Ok(iv) => (find_gaps(&records, iv), false),
-        Err(_) => (Vec::new(), true),
-    };
-    (
-        records,
-        CleanReport {
-            dups_removed,
-            gaps,
-            gap_check_skipped,
-        },
-    )
+    let gaps = find_gaps(&records, timeframe.interval_ms());
+    (records, CleanReport { dups_removed, gaps })
 }
 
 /// 缺口留样(行内 `tracing::warn(samples = ?...)` 用, 与坏行留样同 capped 风格).
@@ -114,6 +88,7 @@ pub(crate) fn gap_samples(gaps: &[Gap]) -> Vec<Gap> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::DataSource;
 
     fn rec(t: i64) -> Record {
         Record {
@@ -124,6 +99,10 @@ mod tests {
             close: 11.0,
             volume: 100.0,
         }
+    }
+
+    fn tf(s: &str) -> Timeframe {
+        Timeframe::parse(DataSource::Binance, s).unwrap()
     }
 
     #[test]
@@ -177,10 +156,10 @@ mod tests {
     }
 
     #[test]
-    fn clean_sorted_skips_gap_check_on_unknown_tf() {
-        let (out, report) = clean_sorted(vec![rec(0), rec(60_000)], "3d");
+    fn clean_sorted_uses_timeframe_interval() {
+        let (out, report) = clean_sorted(vec![rec(0), rec(60_000)], &tf("1m"));
         assert_eq!(out.len(), 2);
-        assert!(report.gap_check_skipped);
         assert!(report.gaps.is_empty());
+        assert_eq!(report.dups_removed, 0);
     }
 }

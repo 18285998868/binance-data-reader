@@ -7,9 +7,11 @@
 #   错误: dir = "/data/nutilustrader/data/binance/data/um/daily/klines"
 #   正确: dir = "/data/nutilustrader/data"
 #
+# 单品种单周期: 一个文件只描述一对 symbol/timeframe, 多品种请写多个文件或调多次 load_columns.
+# 日期语义均为 UTC; end_date 含当日整天.
 type = "binance" # 数据源类型, 必填, 可选参数: "binance" | "dukascopy"
 dir = "/data/nutilustrader/data" # K线数据根目录, 必填
-symbol = ["BTCUSDT"] # 品种列表, 必填
-timeframes = ["1d"] # 时间帧列表, 必填; binance: "1m"~"1d", dukascopy: "M1"/"H1"/"D1"
+symbol = "BTCUSDT" # 品种, 必填, 单值
+timeframe = "1d" # 时间帧, 必填, 单值; binance: "1m"~"1d", dukascopy: "M1"/"H1"/"D1" (另兼容 "1m"/"1h"/"1d")
 # start_date = "2024-01-01" # 数据起始日期, 可选, 默认值: 无(全部数据), 可选参数: YYYY-MM-DD
-# end_date = "2024-12-31" # 数据结束日期, 可选, 默认值: 无(全部数据), 可选参数: YYYY-MM-DD
+# end_date = "2024-12-31" # 数据结束日期(含当日), 可选, 默认值: 无(全部数据), 可选参数: YYYY-MM-DD

@@ -2,8 +2,7 @@
 //!
 //! The dict mirrors `DataConfig` (`type/dir/symbol/timeframe/start_date/end_date`)
 //! and returns `{time, open, high, low, close, volume}` column lists.
-
-use std::path::PathBuf;
+//! 解析在边界一次完成（`DataConfig::new`），非法输入直接报 `ValueError`。
 
 use pyo3::exceptions::{PyKeyError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
@@ -50,14 +49,20 @@ pub(crate) fn py_load_columns(config: &Bound<'_, PyDict>) -> PyResult<Py<PyAny>>
             )));
         }
     };
-    let data_cfg = DataConfig {
+    let dir: String = extract_required(config, "dir")?;
+    let symbol: String = extract_required(config, "symbol")?;
+    let timeframe: String = extract_required(config, "timeframe")?;
+    let start_date: Option<String> = extract_optional(config, "start_date")?;
+    let end_date: Option<String> = extract_optional(config, "end_date")?;
+    let data_cfg = DataConfig::new(
         source_type,
-        dir: PathBuf::from(extract_required::<String>(config, "dir")?),
-        symbol: extract_required(config, "symbol")?,
-        timeframe: extract_required(config, "timeframe")?,
-        start_date: extract_optional(config, "start_date")?,
-        end_date: extract_optional(config, "end_date")?,
-    };
+        &dir,
+        &symbol,
+        &timeframe,
+        start_date.as_deref(),
+        end_date.as_deref(),
+    )
+    .map_err(|e| PyValueError::new_err(e.to_string()))?;
     let cols = crate::app::load_columns(&data_cfg).map_err(py_err)?;
     Python::attach(|py| {
         let out = PyDict::new(py);

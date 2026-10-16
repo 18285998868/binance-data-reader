@@ -3,16 +3,16 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum ReaderError {
-    #[error("I/O: {0}")]
+    #[error("io: {0}")]
     Io(#[from] std::io::Error),
 
-    #[error("CSV: {0}")]
+    #[error("csv: {0}")]
     Csv(#[from] csv::Error),
 
-    #[error("Zip: {0}")]
+    #[error("zip: {0}")]
     Zip(#[from] zip::result::ZipError),
 
-    #[error("UTF-8: {0}")]
+    #[error("utf-8: {0}")]
     Utf8(#[from] std::str::Utf8Error),
 
     #[error("config: {0}")]

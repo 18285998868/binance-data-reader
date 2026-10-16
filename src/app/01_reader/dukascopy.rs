@@ -10,6 +10,7 @@ use rayon::prelude::*;
 use crate::app::Record;
 use crate::error::ReaderError;
 use crate::error::Result;
+use crate::types::{Symbol, Timeframe};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum PeriodKind {
@@ -19,20 +20,25 @@ enum PeriodKind {
 }
 
 /// Map a requested timeframe to the Dukascopy candles filename part.
-fn expected_tf_part(timeframe: &str) -> &'static str {
-    match timeframe {
-        "M1" | "1m" => "candles_min_1",
-        "H1" | "1h" => "candles_hour_1",
-        _ => "candles_day_1",
+/// `Timeframe` 已按源校验，此处未知映射仍返回 `Err`（不在 release 静默回落），
+/// 避免白名单先扩而映射未加时错拿日线数据。
+fn expected_tf_part(timeframe: &Timeframe) -> Result<&'static str> {
+    match timeframe.as_str() {
+        "M1" | "1m" => Ok("candles_min_1"),
+        "H1" | "1h" => Ok("candles_hour_1"),
+        "D1" | "1d" => Ok("candles_day_1"),
+        other => Err(ReaderError::Config(format!(
+            "unsupported dukascopy timeframe: {other}"
+        ))),
     }
 }
 
-fn period_kind_for_timeframe(timeframe: &str) -> PeriodKind {
-    match expected_tf_part(timeframe) {
+fn period_kind_for_timeframe(timeframe: &Timeframe) -> Result<PeriodKind> {
+    Ok(match expected_tf_part(timeframe)? {
         "candles_min_1" => PeriodKind::Day,
         "candles_hour_1" => PeriodKind::Month,
         _ => PeriodKind::Year,
-    }
+    })
 }
 
 /// Classify an official-mirror filename `{PRICE}_{candles_*}.bi5`.
@@ -50,18 +56,31 @@ fn kind_from_filename(name: &str) -> Option<PeriodKind> {
 /// Parse an official-mirror .bi5 path below `{dir}/dukascopy/{symbol}/`.
 ///
 /// Expected relative shape: `{YYYY}/[{MM}/[{DD}/]]{PRICE}_{candles_*}.bi5`.
-/// Files whose candles part does not match `timeframe` are skipped (`None`).
-fn parse_bi5_path(base: &Path, path: &Path, timeframe: &str) -> Option<(PeriodKind, NaiveDate)> {
+/// Files whose candles part does not match `timeframe` are skipped (`Ok(None)`);
+/// an unmappable timeframe is a hard `Err` (never silently fall back).
+fn parse_bi5_path(
+    base: &Path,
+    path: &Path,
+    timeframe: &Timeframe,
+) -> Result<Option<(PeriodKind, NaiveDate)>> {
     if path.extension().and_then(|s| s.to_str()) != Some("bi5") {
-        return None;
+        return Ok(None);
     }
-    let rel = path.strip_prefix(base).ok()?;
-    let name = rel.file_name()?.to_str()?;
-    let kind = kind_from_filename(name)?;
-    if kind != period_kind_for_timeframe(timeframe) {
-        return None;
+    let Some(rel) = path.strip_prefix(base).ok() else {
+        return Ok(None);
+    };
+    let Some(name) = rel.file_name().and_then(|s| s.to_str()) else {
+        return Ok(None);
+    };
+    let Some(kind) = kind_from_filename(name) else {
+        return Ok(None);
+    };
+    if kind != period_kind_for_timeframe(timeframe)? {
+        return Ok(None);
     }
-    let parent = rel.parent()?;
+    let Some(parent) = rel.parent() else {
+        return Ok(None);
+    };
     let comps: Vec<&str> = parent
         .components()
         .filter_map(|c| c.as_os_str().to_str())
@@ -69,61 +88,89 @@ fn parse_bi5_path(base: &Path, path: &Path, timeframe: &str) -> Option<(PeriodKi
     let date = match kind {
         PeriodKind::Year => {
             let [y] = comps.as_slice() else {
-                return None;
+                return Ok(None);
             };
-            NaiveDate::from_ymd_opt(y.parse().ok()?, 1, 1)?
+            let Ok(y) = y.parse::<i32>() else {
+                return Ok(None);
+            };
+            let Some(d) = NaiveDate::from_ymd_opt(y, 1, 1) else {
+                return Ok(None);
+            };
+            d
         }
         PeriodKind::Month => {
             let [y, m] = comps.as_slice() else {
-                return None;
+                return Ok(None);
             };
-            NaiveDate::from_ymd_opt(y.parse().ok()?, m.parse().ok()?, 1)?
+            let (Ok(y), Ok(m)) = (y.parse::<i32>(), m.parse::<u32>()) else {
+                return Ok(None);
+            };
+            let Some(d) = NaiveDate::from_ymd_opt(y, m, 1) else {
+                return Ok(None);
+            };
+            d
         }
         PeriodKind::Day => {
             let [y, m, d] = comps.as_slice() else {
-                return None;
+                return Ok(None);
             };
-            NaiveDate::from_ymd_opt(y.parse().ok()?, m.parse().ok()?, d.parse().ok()?)?
+            let (Ok(y), Ok(m), Ok(day)) = (y.parse::<i32>(), m.parse::<u32>(), d.parse::<u32>())
+            else {
+                return Ok(None);
+            };
+            let Some(date) = NaiveDate::from_ymd_opt(y, m, day) else {
+                return Ok(None);
+            };
+            date
         }
     };
-    Some((kind, date))
+    Ok(Some((kind, date)))
 }
 
-fn period_end(period_start: NaiveDate, kind: PeriodKind) -> NaiveDate {
-    match kind {
-        PeriodKind::Year => NaiveDate::from_ymd_opt(period_start.year() + 1, 1, 1).unwrap(),
+fn period_end(period_start: NaiveDate, kind: PeriodKind) -> Result<NaiveDate> {
+    let next = match kind {
+        PeriodKind::Year => period_start
+            .year()
+            .checked_add(1)
+            .and_then(|y| NaiveDate::from_ymd_opt(y, 1, 1)),
         PeriodKind::Month => {
             if period_start.month() == 12 {
-                NaiveDate::from_ymd_opt(period_start.year() + 1, 1, 1).unwrap()
+                period_start
+                    .year()
+                    .checked_add(1)
+                    .and_then(|y| NaiveDate::from_ymd_opt(y, 1, 1))
             } else {
-                NaiveDate::from_ymd_opt(period_start.year(), period_start.month() + 1, 1).unwrap()
+                NaiveDate::from_ymd_opt(period_start.year(), period_start.month() + 1, 1)
             }
         }
-        PeriodKind::Day => period_start.succ_opt().unwrap(),
-    }
+        PeriodKind::Day => period_start.succ_opt(),
+    };
+    next.ok_or_else(|| {
+        ReaderError::Parse(format!(
+            "period end out of range for {period_start:?} ({kind:?})"
+        ))
+    })
 }
 
 fn should_skip_file(
     period_start: NaiveDate,
     kind: PeriodKind,
-    start_date: Option<&str>,
-    end_date: Option<&str>,
-) -> bool {
-    let p_end = period_end(period_start, kind);
+    start_date: Option<NaiveDate>,
+    end_date: Option<NaiveDate>,
+) -> Result<bool> {
+    let p_end = period_end(period_start, kind)?;
 
     if let Some(sd) = start_date
-        && let Ok(d) = NaiveDate::parse_from_str(sd, "%Y-%m-%d")
-        && p_end <= d
+        && p_end <= sd
     {
-        return true;
+        return Ok(true);
     }
     if let Some(ed) = end_date
-        && let Ok(d) = NaiveDate::parse_from_str(ed, "%Y-%m-%d")
-        && period_start > d
+        && period_start > ed
     {
-        return true;
+        return Ok(true);
     }
-    false
+    Ok(false)
 }
 
 fn decompress_bi5(path: &Path) -> Result<Vec<u8>> {
@@ -135,17 +182,20 @@ fn decompress_bi5(path: &Path) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
-fn parse_bi5_records(bytes: &[u8], period_start: NaiveDateTime) -> Result<Vec<Record>> {
+/// 解析 bi5 记录：返回值含跳过的坏行数（OHLC 口径与 binance 统一，
+/// `super::is_valid_ohlc`），调用方汇总 warn。
+fn parse_bi5_records(bytes: &[u8], period_start: NaiveDateTime) -> Result<(Vec<Record>, usize)> {
     const REC_SIZE: usize = 24;
     let num_records = bytes.len() / REC_SIZE;
     if num_records == 0 {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), 0));
     }
     if !bytes.len().is_multiple_of(REC_SIZE) {
         tracing::warn!("bi5 data size {} not multiple of 24", bytes.len());
     }
 
     let mut records = Vec::with_capacity(num_records);
+    let mut skipped = 0usize;
     for i in 0..num_records {
         let offset = i * REC_SIZE;
         let rec: &[u8; REC_SIZE] = &bytes[offset..offset + REC_SIZE]
@@ -160,11 +210,17 @@ fn parse_bi5_records(bytes: &[u8], period_start: NaiveDateTime) -> Result<Vec<Re
         };
 
         let time_secs = read_be_u32(0)? as i64;
+        // 字段序经实数据验证为 O,C,L,H（非 O,H,L,C）：365/365 满足 high/low 包络，
+        // 且 |open[i+1]-close[i]| 均值 0.0002（反设为 0.0047）。旧代码 high/close 错位。
         let open = read_be_u32(4)? as f64 / 100000.0;
-        let high = read_be_u32(8)? as f64 / 100000.0;
+        let close = read_be_u32(8)? as f64 / 100000.0;
         let low = read_be_u32(12)? as f64 / 100000.0;
-        let close = read_be_u32(16)? as f64 / 100000.0;
+        let high = read_be_u32(16)? as f64 / 100000.0;
         let volume = read_be_u32(20)? as f64;
+        if !super::is_valid_ohlc(open, high, low, close, volume) {
+            skipped += 1;
+            continue;
+        }
 
         let ts = period_start + chrono::TimeDelta::seconds(time_secs);
         records.push(Record {
@@ -176,10 +232,10 @@ fn parse_bi5_records(bytes: &[u8], period_start: NaiveDateTime) -> Result<Vec<Re
             volume,
         });
     }
-    Ok(records)
+    Ok((records, skipped))
 }
 
-fn load_bi5_data(path: &Path, period_start: NaiveDate) -> Result<Vec<Record>> {
+fn load_bi5_data(path: &Path, period_start: NaiveDate) -> Result<(Vec<Record>, usize)> {
     let bytes = decompress_bi5(path)?;
     let dt = period_start
         .and_hms_opt(0, 0, 0)
@@ -242,22 +298,23 @@ fn load_single_bi5(path: &Path) -> Result<Vec<Record>> {
             .ok_or_else(|| ReaderError::Parse("invalid day dirs".into()))?
         }
     };
-    load_bi5_data(path, period_start)
+    load_bi5_data(path, period_start).map(|(records, _)| records)
 }
 
-#[tracing::instrument(skip_all, fields(dir, symbol, timeframe))]
+#[tracing::instrument(skip_all, fields(symbol, timeframe))]
 pub(crate) fn load_dukascopy_pipeline(
-    dir: &str,
-    symbol: &str,
-    timeframe: &str,
-    start_date: Option<&str>,
-    end_date: Option<&str>,
+    dir: impl AsRef<Path>,
+    symbol: &Symbol,
+    timeframe: &Timeframe,
+    start_date: Option<NaiveDate>,
+    end_date: Option<NaiveDate>,
 ) -> Result<Vec<Record>> {
-    let symbol_dir: PathBuf = Path::new(dir).join("dukascopy").join(symbol);
+    let dir = dir.as_ref();
+    let symbol_dir: PathBuf = dir.join("dukascopy").join(symbol.as_str());
     if !symbol_dir.exists() {
         return Err(ReaderError::Io(std::io::Error::new(
             std::io::ErrorKind::NotFound,
-            format!("directory not found: {dir}/dukascopy/{symbol}"),
+            format!("directory not found: {}/dukascopy/{symbol}", dir.display()),
         )));
     }
 
@@ -279,23 +336,54 @@ pub(crate) fn load_dukascopy_pipeline(
 
     paths.par_sort_unstable();
 
-    let all_records: Vec<Record> = paths
+    /// 单文件结局：`Loaded` 好数据、`Skipped` 意图内跳过（周期不匹配/区间外）、
+    /// `Failed` 硬失败（解压/解析失败），计入零容忍收口。
+    enum FileOutcome {
+        Loaded(Vec<Record>, usize),
+        Skipped,
+        Failed(String),
+    }
+
+    let outcomes: Vec<FileOutcome> = paths
         .par_iter()
-        .filter_map(|path| {
-            let (kind, period_start) = parse_bi5_path(&symbol_dir, path, timeframe)?;
-            if should_skip_file(period_start, kind, start_date, end_date) {
-                return None;
+        .map(|path| {
+            let (kind, period_start) = match parse_bi5_path(&symbol_dir, path, timeframe) {
+                Ok(Some(parsed)) => parsed,
+                Ok(None) => return FileOutcome::Skipped,
+                Err(e) => return FileOutcome::Failed(format!("{}: {e}", path.display())),
+            };
+            match should_skip_file(period_start, kind, start_date, end_date) {
+                Ok(true) => return FileOutcome::Skipped,
+                Ok(false) => {}
+                Err(e) => return FileOutcome::Failed(format!("{}: {e}", path.display())),
             }
             match load_bi5_data(path, period_start) {
-                Ok(records) => Some(records),
-                Err(e) => {
-                    tracing::warn!("failed to load {}: {e}", path.display());
-                    None
-                }
+                Ok((records, skipped)) => FileOutcome::Loaded(records, skipped),
+                Err(e) => FileOutcome::Failed(format!("{}: {e}", path.display())),
             }
         })
-        .flat_map(|v| v)
         .collect();
+
+    let mut failed: Vec<String> = Vec::new();
+    let mut skipped_rows_total = 0usize;
+    let mut all_records: Vec<Record> = Vec::new();
+    for outcome in outcomes {
+        match outcome {
+            FileOutcome::Loaded(records, skipped) => {
+                skipped_rows_total += skipped;
+                all_records.extend(records);
+            }
+            FileOutcome::Skipped => {}
+            FileOutcome::Failed(detail) => failed.push(detail),
+        }
+    }
+    super::fail_on_hard_errors("dukascopy", &failed)?;
+    if skipped_rows_total > 0 {
+        tracing::warn!(
+            rows = skipped_rows_total,
+            "loaded dukascopy with data loss: invalid OHLC rows skipped"
+        );
+    }
 
     tracing::info!(
         rows = all_records.len(),
@@ -317,13 +405,37 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    use crate::config::DataSource;
+
+    fn sym(s: &str) -> Symbol {
+        Symbol::parse(s).unwrap()
+    }
+    fn tf_d(s: &str) -> Timeframe {
+        Timeframe::parse(DataSource::Dukascopy, s).unwrap()
+    }
+    fn pd(s: &str) -> NaiveDate {
+        NaiveDate::parse_from_str(s, "%Y-%m-%d").unwrap()
+    }
+
     // — kind_from_filename / parse_bi5_path —
+
+    fn parsed(base: &Path, rel: &str, tf: &str) -> Option<(PeriodKind, NaiveDate)> {
+        parse_bi5_path(base, &base.join(rel), &tf_d(tf)).unwrap()
+    }
+
+    fn skipped(
+        period_start: NaiveDate,
+        kind: PeriodKind,
+        start: Option<NaiveDate>,
+        end: Option<NaiveDate>,
+    ) -> bool {
+        should_skip_file(period_start, kind, start, end).unwrap()
+    }
 
     #[test]
     fn parse_path_d1_year() {
         let base = Path::new("/data/dukascopy/EURUSD");
-        let p = base.join("2025/BID_candles_day_1.bi5");
-        let (kind, date) = parse_bi5_path(base, &p, "D1").unwrap();
+        let (kind, date) = parsed(base, "2025/BID_candles_day_1.bi5", "D1").expect("parsed");
         assert_eq!(kind, PeriodKind::Year);
         assert_eq!(date, NaiveDate::from_ymd_opt(2025, 1, 1).unwrap());
     }
@@ -331,8 +443,7 @@ mod tests {
     #[test]
     fn parse_path_h1_month() {
         let base = Path::new("/data/dukascopy/EURUSD");
-        let p = base.join("2025/03/ASK_candles_hour_1.bi5");
-        let (kind, date) = parse_bi5_path(base, &p, "H1").unwrap();
+        let (kind, date) = parsed(base, "2025/03/ASK_candles_hour_1.bi5", "H1").expect("parsed");
         assert_eq!(kind, PeriodKind::Month);
         assert_eq!(date, NaiveDate::from_ymd_opt(2025, 3, 1).unwrap());
     }
@@ -340,8 +451,7 @@ mod tests {
     #[test]
     fn parse_path_m1_day() {
         let base = Path::new("/data/dukascopy/EURUSD");
-        let p = base.join("2025/03/01/BID_candles_min_1.bi5");
-        let (kind, date) = parse_bi5_path(base, &p, "M1").unwrap();
+        let (kind, date) = parsed(base, "2025/03/01/BID_candles_min_1.bi5", "M1").expect("parsed");
         assert_eq!(kind, PeriodKind::Day);
         assert_eq!(date, NaiveDate::from_ymd_opt(2025, 3, 1).unwrap());
     }
@@ -350,20 +460,20 @@ mod tests {
     fn parse_path_timeframe_aliases() {
         let base = Path::new("/data/dukascopy/X");
         assert_eq!(
-            parse_bi5_path(base, &base.join("2025/BID_candles_day_1.bi5"), "1d")
-                .unwrap()
+            parsed(base, "2025/BID_candles_day_1.bi5", "1d")
+                .expect("parsed")
                 .0,
             PeriodKind::Year
         );
         assert_eq!(
-            parse_bi5_path(base, &base.join("2025/03/BID_candles_hour_1.bi5"), "1h")
-                .unwrap()
+            parsed(base, "2025/03/BID_candles_hour_1.bi5", "1h")
+                .expect("parsed")
                 .0,
             PeriodKind::Month
         );
         assert_eq!(
-            parse_bi5_path(base, &base.join("2025/03/01/BID_candles_min_1.bi5"), "1m")
-                .unwrap()
+            parsed(base, "2025/03/01/BID_candles_min_1.bi5", "1m")
+                .expect("parsed")
                 .0,
             PeriodKind::Day
         );
@@ -373,21 +483,21 @@ mod tests {
     fn parse_path_wrong_timeframe_skipped() {
         let base = Path::new("/data/dukascopy/X");
         // H1 file must not match a D1 request.
-        assert!(parse_bi5_path(base, &base.join("2025/03/BID_candles_hour_1.bi5"), "D1").is_none());
-        assert!(parse_bi5_path(base, &base.join("2025/BID_candles_day_1.bi5"), "M1").is_none());
+        assert!(parsed(base, "2025/03/BID_candles_hour_1.bi5", "D1").is_none());
+        assert!(parsed(base, "2025/BID_candles_day_1.bi5", "M1").is_none());
     }
 
     #[test]
     fn parse_path_bad_depth_or_names_skipped() {
         let base = Path::new("/data/dukascopy/X");
         // Year file nested too deep.
-        assert!(parse_bi5_path(base, &base.join("2025/03/BID_candles_day_1.bi5"), "D1").is_none());
+        assert!(parsed(base, "2025/03/BID_candles_day_1.bi5", "D1").is_none());
         // Non-numeric dirs.
-        assert!(parse_bi5_path(base, &base.join("YYYY/BID_candles_day_1.bi5"), "D1").is_none());
+        assert!(parsed(base, "YYYY/BID_candles_day_1.bi5", "D1").is_none());
         // Old-layout filename no longer matches.
-        assert!(parse_bi5_path(base, &base.join("EURUSD-D1-2025.bi5"), "D1").is_none());
+        assert!(parsed(base, "EURUSD-D1-2025.bi5", "D1").is_none());
         // Non-bi5 extension.
-        assert!(parse_bi5_path(base, &base.join("2025/readme.txt"), "D1").is_none());
+        assert!(parsed(base, "2025/readme.txt", "D1").is_none());
     }
 
     // — should_skip_file —
@@ -395,58 +505,57 @@ mod tests {
     #[test]
     fn skip_file_no_filter() {
         let d = NaiveDate::from_ymd_opt(2025, 1, 1).unwrap();
-        assert!(!should_skip_file(d, PeriodKind::Day, None, None));
-        assert!(!should_skip_file(d, PeriodKind::Month, None, None));
-        assert!(!should_skip_file(d, PeriodKind::Year, None, None));
+        assert!(!skipped(d, PeriodKind::Day, None, None));
+        assert!(!skipped(d, PeriodKind::Month, None, None));
+        assert!(!skipped(d, PeriodKind::Year, None, None));
     }
 
     #[test]
     fn skip_file_before_start() {
         // file covers 2025-01-01 (day), start=2025-01-02 => skip
         let d = NaiveDate::from_ymd_opt(2025, 1, 1).unwrap();
-        assert!(should_skip_file(
-            d,
-            PeriodKind::Day,
-            Some("2025-01-02"),
-            None
-        ));
+        assert!(skipped(d, PeriodKind::Day, Some(pd("2025-01-02")), None));
         // day file ends at 2025-01-02, starts at 2025-01-01, start=2025-01-01 => not skip
-        assert!(!should_skip_file(
-            d,
-            PeriodKind::Day,
-            Some("2025-01-01"),
-            None
-        ));
+        assert!(!skipped(d, PeriodKind::Day, Some(pd("2025-01-01")), None));
     }
 
     #[test]
     fn skip_file_after_end() {
         let d = NaiveDate::from_ymd_opt(2025, 1, 5).unwrap();
-        assert!(should_skip_file(
-            d,
-            PeriodKind::Day,
-            None,
-            Some("2025-01-04")
-        ));
+        assert!(skipped(d, PeriodKind::Day, None, Some(pd("2025-01-04"))));
     }
 
     #[test]
     fn skip_file_year_overlap() {
         let d = NaiveDate::from_ymd_opt(2025, 1, 1).unwrap();
         // year 2025 ends 2026-01-01, end=2025-06 => overlap
-        assert!(!should_skip_file(
+        assert!(!skipped(
             d,
             PeriodKind::Year,
-            Some("2025-06-01"),
-            Some("2025-06-30")
+            Some(pd("2025-06-01")),
+            Some(pd("2025-06-30"))
         ));
         // year 2025 ends 2026-01-01, end=2024-12 => no overlap
-        assert!(should_skip_file(
+        assert!(skipped(
             d,
             PeriodKind::Year,
-            Some("2024-01-01"),
-            Some("2024-12-31")
+            Some(pd("2024-01-01")),
+            Some(pd("2024-12-31"))
         ));
+    }
+
+    #[test]
+    fn period_end_out_of_range_errors() {
+        // 旧代码此处 unwrap panic；现返回 Err，由管线计入硬失败。
+        assert!(period_end(NaiveDate::MAX, PeriodKind::Day).is_err());
+        assert!(period_end(NaiveDate::MAX, PeriodKind::Year).is_err());
+        assert!(
+            period_end(
+                NaiveDate::from_ymd_opt(2025, 1, 1).unwrap(),
+                PeriodKind::Day
+            )
+            .is_ok()
+        );
     }
 
     // — parse_bi5_records —
@@ -454,17 +563,17 @@ mod tests {
     fn make_d1_record(
         day_offset: u32,
         open: u32,
-        high: u32,
-        low: u32,
         close: u32,
+        low: u32,
+        high: u32,
         vol: u32,
     ) -> [u8; 24] {
         let mut rec = [0u8; 24];
         rec[0..4].copy_from_slice(&day_offset.to_be_bytes());
         rec[4..8].copy_from_slice(&open.to_be_bytes());
-        rec[8..12].copy_from_slice(&high.to_be_bytes());
+        rec[8..12].copy_from_slice(&close.to_be_bytes());
         rec[12..16].copy_from_slice(&low.to_be_bytes());
-        rec[16..20].copy_from_slice(&close.to_be_bytes());
+        rec[16..20].copy_from_slice(&high.to_be_bytes());
         rec[20..24].copy_from_slice(&vol.to_be_bytes());
         rec
     }
@@ -475,8 +584,9 @@ mod tests {
             .unwrap()
             .and_hms_opt(0, 0, 0)
             .unwrap();
-        let rec = make_d1_record(0, 100000, 101000, 99000, 100500, 5000);
-        let records = parse_bi5_records(&rec, dt).unwrap();
+        let rec = make_d1_record(0, 100000, 100500, 99000, 101000, 5000);
+        let (records, skipped) = parse_bi5_records(&rec, dt).unwrap();
+        assert_eq!(skipped, 0);
         assert_eq!(records.len(), 1);
         assert!((records[0].open - 1.0).abs() < 0.0001);
         assert!((records[0].high - 1.01).abs() < 0.0001);
@@ -491,12 +601,13 @@ mod tests {
             .unwrap()
             .and_hms_opt(0, 0, 0)
             .unwrap();
-        let r1 = make_d1_record(0, 100000, 101000, 99000, 100500, 5000);
-        let r2 = make_d1_record(86400, 101000, 102000, 100000, 101500, 6000);
+        let r1 = make_d1_record(0, 100000, 100500, 99000, 101000, 5000);
+        let r2 = make_d1_record(86400, 101000, 101500, 100000, 102000, 6000);
         let mut data = Vec::new();
         data.extend_from_slice(&r1);
         data.extend_from_slice(&r2);
-        let records = parse_bi5_records(&data, dt).unwrap();
+        let (records, skipped) = parse_bi5_records(&data, dt).unwrap();
+        assert_eq!(skipped, 0);
         assert_eq!(records.len(), 2);
         assert_eq!(records[0].open_time + 86_400_000, records[1].open_time);
     }
@@ -507,7 +618,8 @@ mod tests {
             .unwrap()
             .and_hms_opt(0, 0, 0)
             .unwrap();
-        let records = parse_bi5_records(&[], dt).unwrap();
+        let (records, skipped) = parse_bi5_records(&[], dt).unwrap();
+        assert_eq!(skipped, 0);
         assert!(records.is_empty());
     }
 
@@ -520,8 +632,33 @@ mod tests {
         // 25 bytes = 1 full record + 1 byte
         let mut data = vec![0u8; 25];
         data[0..4].copy_from_slice(&0u32.to_be_bytes());
-        let records = parse_bi5_records(&data, dt).unwrap();
+        data[4..8].copy_from_slice(&100000u32.to_be_bytes());
+        data[8..12].copy_from_slice(&100500u32.to_be_bytes());
+        data[12..16].copy_from_slice(&99000u32.to_be_bytes());
+        data[16..20].copy_from_slice(&101000u32.to_be_bytes());
+        data[20..24].copy_from_slice(&1000u32.to_be_bytes());
+        let (records, skipped) = parse_bi5_records(&data, dt).unwrap();
+        assert_eq!(skipped, 0);
         assert_eq!(records.len(), 1);
+    }
+
+    #[test]
+    fn parse_records_skips_invalid_ohlc() {
+        // 高低错位（high < low）与零价同 binance 口径跳过并计数。
+        let dt = NaiveDate::from_ymd_opt(2025, 1, 1)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap();
+        let good = make_d1_record(0, 100000, 100500, 99000, 101000, 5000);
+        let bad_hl = make_d1_record(86400, 100000, 100500, 101000, 99000, 5000);
+        let bad_zero = make_d1_record(2 * 86400, 0, 0, 0, 0, 5000);
+        let mut data = Vec::new();
+        data.extend_from_slice(&good);
+        data.extend_from_slice(&bad_hl);
+        data.extend_from_slice(&bad_zero);
+        let (records, skipped) = parse_bi5_records(&data, dt).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(skipped, 2);
     }
 
     // — load_single_bi5 (integration with real file) —
@@ -569,9 +706,9 @@ mod tests {
             let mut rec = [0u8; 24];
             rec[0..4].copy_from_slice(&time_secs.to_be_bytes());
             rec[4..8].copy_from_slice(&100000u32.to_be_bytes());
-            rec[8..12].copy_from_slice(&101000u32.to_be_bytes());
+            rec[8..12].copy_from_slice(&100500u32.to_be_bytes());
             rec[12..16].copy_from_slice(&99000u32.to_be_bytes());
-            rec[16..20].copy_from_slice(&100500u32.to_be_bytes());
+            rec[16..20].copy_from_slice(&101000u32.to_be_bytes());
             rec[20..24].copy_from_slice(&1000u32.to_be_bytes());
             raw.extend_from_slice(&rec);
         }
@@ -587,9 +724,20 @@ mod tests {
         let path = setup_file(&tmp, "EURUSD/2025/BID_candles_day_1.bi5");
         create_synthetic_bi5(&path, 100);
         let records =
-            load_dukascopy_pipeline(tmp.path().to_str().unwrap(), "EURUSD", "D1", None, None)
-                .unwrap();
+            load_dukascopy_pipeline(tmp.path(), &sym("EURUSD"), &tf_d("D1"), None, None).unwrap();
         assert_eq!(records.len(), 100);
+    }
+
+    #[test]
+    fn load_pipeline_corrupt_file_errors() {
+        // 坏 bi5 是硬失败（零容忍）：即使有好文件，整批也 Err 并报告。
+        let tmp = TempDir::new().unwrap();
+        create_synthetic_bi5(&setup_file(&tmp, "EURUSD/2025/BID_candles_day_1.bi5"), 10);
+        let bad = setup_file(&tmp, "EURUSD/2026/BID_candles_day_1.bi5");
+        std::fs::write(&bad, b"this is not lzma").unwrap();
+        let result = load_dukascopy_pipeline(tmp.path(), &sym("EURUSD"), &tf_d("D1"), None, None);
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("1 file(s) failed"), "unexpected: {msg}");
     }
 
     #[test]
@@ -601,8 +749,7 @@ mod tests {
             7,
         );
         let records =
-            load_dukascopy_pipeline(tmp.path().to_str().unwrap(), "EURUSD", "D1", None, None)
-                .unwrap();
+            load_dukascopy_pipeline(tmp.path(), &sym("EURUSD"), &tf_d("D1"), None, None).unwrap();
         assert_eq!(records.len(), 10);
     }
 
@@ -615,11 +762,11 @@ mod tests {
         }
         // filter to only day 2
         let records = load_dukascopy_pipeline(
-            tmp.path().to_str().unwrap(),
-            "EURUSD",
-            "M1",
-            Some("2025-01-02"),
-            Some("2025-01-02"),
+            tmp.path(),
+            &sym("EURUSD"),
+            &tf_d("M1"),
+            Some(pd("2025-01-02")),
+            Some(pd("2025-01-02")),
         )
         .unwrap();
         assert_eq!(records.len(), 5);
@@ -638,14 +785,14 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         std::fs::create_dir_all(tmp.path().join("dukascopy").join("EURUSD")).unwrap();
         let records =
-            load_dukascopy_pipeline(tmp.path().to_str().unwrap(), "EURUSD", "D1", None, None)
-                .unwrap();
+            load_dukascopy_pipeline(tmp.path(), &sym("EURUSD"), &tf_d("D1"), None, None).unwrap();
         assert!(records.is_empty());
     }
 
     #[test]
     fn load_pipeline_nonexistent_dir_errors() {
-        let result = load_dukascopy_pipeline("/nonexistent/path", "EURUSD", "D1", None, None);
+        let result =
+            load_dukascopy_pipeline("/nonexistent/path", &sym("EURUSD"), &tf_d("D1"), None, None);
         assert!(result.is_err());
         match result.unwrap_err() {
             ReaderError::Io(_) => {}
@@ -662,17 +809,16 @@ mod tests {
             let mut rec = [0u8; 24];
             rec[0..4].copy_from_slice(&(i * 86400).to_be_bytes());
             rec[4..8].copy_from_slice(&100000u32.to_be_bytes());
-            rec[8..12].copy_from_slice(&101000u32.to_be_bytes());
+            rec[8..12].copy_from_slice(&100500u32.to_be_bytes());
             rec[12..16].copy_from_slice(&99000u32.to_be_bytes());
-            rec[16..20].copy_from_slice(&100500u32.to_be_bytes());
+            rec[16..20].copy_from_slice(&101000u32.to_be_bytes());
             rec[20..24].copy_from_slice(&1000u32.to_be_bytes());
             raw.extend_from_slice(&rec);
         }
         create_synthetic_bi5_raw(&path, &raw);
 
         let records =
-            load_dukascopy_pipeline(tmp.path().to_str().unwrap(), "EURUSD", "D1", None, None)
-                .unwrap();
+            load_dukascopy_pipeline(tmp.path(), &sym("EURUSD"), &tf_d("D1"), None, None).unwrap();
         assert_eq!(records.len(), 5);
     }
 
@@ -689,14 +835,14 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         std::fs::create_dir_all(tmp.path().join("dukascopy").join("EURUSD")).unwrap();
         let records =
-            load_dukascopy_pipeline(tmp.path().to_str().unwrap(), "EURUSD", "D1", None, None)
-                .unwrap();
+            load_dukascopy_pipeline(tmp.path(), &sym("EURUSD"), &tf_d("D1"), None, None).unwrap();
         assert!(records.is_empty());
     }
 
     #[test]
     fn dukascopy_reader_missing_dir() {
-        let result = load_dukascopy_pipeline("/nonexistent", "EURUSD", "D1", None, None);
+        let result =
+            load_dukascopy_pipeline("/nonexistent", &sym("EURUSD"), &tf_d("D1"), None, None);
         assert!(result.is_err());
     }
 }

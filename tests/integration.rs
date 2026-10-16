@@ -4,6 +4,17 @@ use tempfile::TempDir;
 
 use kline_reader::{DataConfig, DataSource, load_columns};
 
+fn cfg(
+    source: DataSource,
+    dir: std::path::PathBuf,
+    symbol: &str,
+    tf: &str,
+    start: Option<&str>,
+    end: Option<&str>,
+) -> DataConfig {
+    DataConfig::new(source, &dir, symbol, tf, start, end).unwrap()
+}
+
 mod common;
 
 use common::create_test_zip;
@@ -23,14 +34,7 @@ fn integration_global_sort_when_filename_order_conflicts() {
     let csv_b = "1704067140000,10.0,11.0,9.0,10.5,500.0,0,0,0,0,0,0\n";
     create_test_zip(&kline_dir, "U-1m-2024-01-01.zip", csv_b);
 
-    let spec = DataConfig {
-        source_type: DataSource::Binance,
-        dir: data_dir,
-        symbol: "T".into(),
-        timeframe: "1m".into(),
-        start_date: None,
-        end_date: None,
-    };
+    let spec = cfg(DataSource::Binance, data_dir, "T", "1m", None, None);
     let cols = load_columns(&spec).unwrap();
     assert_eq!(cols.len(), 2);
     assert_eq!(cols.time[0], 1704067140000);
@@ -58,14 +62,14 @@ fn integration_load_multiple_days() {
 
     std::fs::write(kline_dir.join("readme.txt"), b"hello").unwrap();
 
-    let spec = DataConfig {
-        source_type: DataSource::Binance,
-        dir: data_dir,
-        symbol: "BTCUSDT".into(),
-        timeframe: "1m".into(),
-        start_date: Some("2024-01-01".into()),
-        end_date: Some("2024-01-02".into()),
-    };
+    let spec = cfg(
+        DataSource::Binance,
+        data_dir,
+        "BTCUSDT",
+        "1m",
+        Some("2024-01-01"),
+        Some("2024-01-02"),
+    );
     let cols = load_columns(&spec).unwrap();
     assert_eq!(cols.len(), 2);
     assert_eq!(cols.time[0], 1704067200000);
@@ -87,28 +91,28 @@ fn integration_load_empty_range() {
     let csv = "1704067200000,2200.0,2210.0,2190.0,2195.0,500.0,0,0,0,0,0,0\n";
     create_test_zip(&kline_dir, "ETHUSDT-1m-2024-01-01.zip", csv);
 
-    let spec = DataConfig {
-        source_type: DataSource::Binance,
-        dir: data_dir,
-        symbol: "ETHUSDT".into(),
-        timeframe: "1m".into(),
-        start_date: Some("2025-01-01".into()),
-        end_date: None,
-    };
+    let spec = cfg(
+        DataSource::Binance,
+        data_dir,
+        "ETHUSDT",
+        "1m",
+        Some("2025-01-01"),
+        None,
+    );
     let cols = load_columns(&spec).unwrap();
     assert!(cols.is_empty());
 }
 
 #[test]
 fn integration_load_missing_directory() {
-    let spec = DataConfig {
-        source_type: DataSource::Binance,
-        dir: Path::new("/tmp/nonexistent_reader_test").to_path_buf(),
-        symbol: "X".into(),
-        timeframe: "1m".into(),
-        start_date: None,
-        end_date: None,
-    };
+    let spec = cfg(
+        DataSource::Binance,
+        Path::new("/tmp/nonexistent_reader_test").to_path_buf(),
+        "X",
+        "1m",
+        None,
+        None,
+    );
     let result = load_columns(&spec);
     assert!(result.is_err());
     match result.unwrap_err() {
@@ -132,14 +136,7 @@ fn integration_all_data_when_no_date_filter() {
     let csv2 = "1704153600000,102.0,103.0,101.0,102.5,900.0,0,0,0,0,0,0\n";
     create_test_zip(&kline_dir, "SOLUSDT-1m-2024-01-02.zip", csv2);
 
-    let spec = DataConfig {
-        source_type: DataSource::Binance,
-        dir: data_dir,
-        symbol: "SOLUSDT".into(),
-        timeframe: "1m".into(),
-        start_date: None,
-        end_date: None,
-    };
+    let spec = cfg(DataSource::Binance, data_dir, "SOLUSDT", "1m", None, None);
     let cols = load_columns(&spec).unwrap();
     assert_eq!(cols.len(), 3);
     assert_eq!(cols.time[0], 1704067200000);

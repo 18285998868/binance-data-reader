@@ -22,7 +22,7 @@ dir = "/data/nutilustrader/data" # 必填，数据根目录(程序按数据源�
 symbol = "BTCUSDT" # 必填，单品种
 timeframe = "1d" # 必填，单周期；binance "1m"~"1d"，dukascopy "M1"/"H1"/"D1"
 # start_date = "2024-01-01" # 可选
-# end_date = "2024-12-31" # 可选
+# end_date = "2024-12-31" # 可选，含当日整天(UTC)
 ```
 
 ```rust
@@ -74,17 +74,18 @@ tests/
 解析层：
 
 1. `DataConfig` 为 serde 反序列化目标，同时是 `load_columns` 入参(单品种×单周期)。
-2. `type` 重命名到 `source_type: DataSource`；`dir: PathBuf`(数据根目录)；`symbol/timeframe: String`；`start_date/end_date: Option<String>` 缺省 None；容器 `#[serde(default)]` + `Default`(空值)，缺字段不断反序列化，交 `validate` 报错。
-3. `DataSource` 为 `binance|dukascopy` 小写枚举。
+2. `type` 重命名到 `source_type: DataSource`；`dir: PathBuf`(数据根目录)；`symbol: Symbol` / `timeframe: Timeframe`(已验证新类型)；`start_date/end_date: Option<NaiveDate>`。
+3. 缺必填字段(`type/dir/symbol/timeframe`)即反序列化失败，不静默 default；非法值经 `DataConfig::new` fail-fast 报 `Config` 错。
+4. `DataSource` 为 `binance|dukascopy` 小写枚举。
 
 ### app/mod
 
-1. 先 `config.validate()`：symbol/timeframe 非空，分源 timeframe 白名单(binance 12 值 / dukascopy 6 值)，日期 `YYYY-MM-DD` 合法且 `start≤end`，失败直接 `Config` 报错(编程构造同样 fail-fast)。
-2. `dir.to_str()` 非 UTF-8 路径直接 `Parse` 报错。
+1. `DataConfig::new` / 反序列化即完全校验：symbol 非空，分源 timeframe 白名单(binance 12 值 / dukascopy 6 值)，日期 `YYYY-MM-DD` 合法且 `start≤end`，失败直接 `Config` 报错。
+2. `dir` 以 `impl AsRef<Path>` 透传，支持非 UTF-8 路径。
 3. 按 `source` 分发到 binance / dukascopy 管线，透传 `start_date/end_date`。
-4. 合并后 `par_sort_by_key(open_time)` 全局排序。
-5. 调 `clean::clean_sorted(records, timeframe)`：去重数>0 则 warn；未知周期则 warn 跳过缺口检查；有缺口则 warn(段数/缺数/留样)，序列保持原样。
-6. `KlineColumns::from(records)` 返回。
+4. 合并后先行级 UTC 日期裁剪(`[start日00:00, end次日00:00)`，`end_date` 含当日整天)，再 `par_sort_by_key(open_time)` 全局排序。
+5. 调 `clean::clean_sorted(records, timeframe)`：去重数>0 则 warn；有缺口则 warn(段数/缺数/留样)，序列保持原样。
+6. `KlineColumns::from(records)` 返回；单文件硬失败(损坏 zip/bi5、无 CSV、非法文件名日期)超零容忍阈值直接整批 `Err` 并报告失败数+留样路径。
 
 ### 01_reader/binance
 
@@ -92,18 +93,18 @@ tests/
 2. 文件名取 stem 末 10 字符做日期形状校验(`YYYY-MM-DD`)，合法才做字符串区间过滤；形状像日期但非法(如 2024-13-01)直接 `Parse` 报错跳过该文件。
 3. `par_sort_unstable` 排路径，`par_iter` 并行解压解析。
 4. 单 zip 取首个 `.csv`(大小写不敏感)，无 csv 即 `Parse` 报错跳过该文件。
-5. 表头判别：首行严格等于标准 12 列才算表头(CRLF 兼容)；数字首字段永不判为表头(误判行只坏一行，不丢全文件)。
-6. 行解析：取前 6 列，`open_time: i64 ≥ 0`，价格/量 `f64` 有限且 `≥ 0`；坏行记数+留样(上限 5)后跳过，不炸全文件。
-7. 损坏 zip 整文件 warn 跳过；结束打 `rows + elapsed` 日志。
+5. 表头判别：首行严格等于标准 12 列才算表头(CRLF 兼容)；数字首字段永不判为表头(误判行只坏一行，不丢全文件)。无尾换行单行按单行解析，首部空行只跳行。
+6. 行解析：取前 6 列，`open_time: i64 ≥ 0`，价格有限且 `> 0`、量有限且 `≥ 0`，且 `high≥max/low≤min`(与 dukascopy 同口径，`is_valid_ohlc`)；坏行记数+留样(上限 5)后跳过，不炸全文件。
+7. 单文件硬失败(损坏 zip、无 csv、非法文件名日期)计入零容忍收口，超阈值整批 `Err`；结束打 `rows + elapsed` 日志。
 
 ### 01_reader/dukascopy
 
 1. 递归扫描(`walkdir`) `{dir}/dukascopy/{symbol}/` 下全部 `*.bi5`；symbol 目录不存在返 `Io(NotFound)` 带路径。
-2. 文件名分类(精确匹配)：`{PRICE}_candles_day_1` 按年、`{PRICE}_candles_hour_1` 按月、`{PRICE}_candles_min_1` 按天；candles 段与请求 timeframe 不一致的文件直接跳过(M1/1m→min_1，H1/1h→hour_1，其余→day_1)。
-3. 周期起点从路径取：年文件取 `{YYYY}`，月文件取 `{YYYY}/{MM}`，天文件取 `{YYYY}/{MM}/{DD}`；层数/数字非法直接跳过(旧 `{symbol}-{tf}-{周期}.bi5` 命名不再识别)。
-4. 区间重叠过滤：`period_end ≤ start` 跳过，`period_start > end` 跳过，年/月文件有重叠即保留。
-5. `lzma_rs` 解压；每 24 字节大端解析：`time_secs:u32` + 4×价格(`/100000`) + `volume`；`open_time = period_start午夜 + Δ秒`。
-6. 尾部非 24 整除只 warn；损坏文件 warn 跳过；结束打 `rows + elapsed` 日志。
+2. 文件名分类(精确匹配)：`{PRICE}_candles_day_1` 按年、`{PRICE}_candles_hour_1` 按月、`{PRICE}_candles_min_1` 按天；candles 段与请求 timeframe 不一致的文件直接跳过(M1/1m→min_1，H1/1h→hour_1，其余→day_1)。未知映射直接 `Config` 报错，不静默回落。
+3. 周期起点从路径取：年文件取 `{YYYY}`，月文件取 `{YYYY}/{MM}`，天文件取 `{YYYY}/{MM}/{DD}`；层数/数字非法直接跳过(旧 `{symbol}-{tf}-{周期}.bi5` 命名不再识别)。周期结束用 checked 计算，溢出即该文件硬失败。
+4. 区间重叠过滤：`period_end ≤ start` 跳过，`period_start > end` 跳过，年/月文件有重叠即保留；合并后另有行级 UTC 裁剪兜底越界 bar。
+5. `lzma_rs` 解压；每 24 字节大端解析：`time_secs:u32` + open/close/low/high(各 u32 `/100000`，**字段序 O,C,L,H**) + `volume`；`open_time = period_start午夜 + Δ秒`；坏 OHLC 行按统一口径跳过计数。
+6. 尾部非 24 整除只 warn；单文件硬失败(解压/解析失败)计入零容忍收口，超阈值整批 `Err`；结束打 `rows + elapsed` 日志。
 
 ### 03_column & 02_clean
 
@@ -118,9 +119,12 @@ tests/
 - 当文件名日期非法(如 2024-13-01)时，会误读区间外数据，
   - 解决: 日期形状但非法直接 `Parse` 报错跳过该文件，不过滤进合并
   - 文件: `src/app/01_reader/binance.rs`(`extract_date_from_filename`)
-- 当单个 zip/bi5 损坏时，会中断整批加载，
-  - 解决: 单文件失败只 warn 跳过，合并其余好文件
-  - 文件: `src/app/01_reader/binance.rs`、`src/app/01_reader/dukascopy.rs`
+- 当 dukascopy high/close 进策略错位时，回测用错价格，
+  - 解决: 实数据验证字段序为 O,C,L,H（旧代码按 O,H,L,C 读，high/close 互换）；现按正确槽位解析 + 统一 OHLC 校验兜底
+  - 文件: `src/app/01_reader/dukascopy.rs`(`parse_bi5_records`)
+- 当单个 zip/bi5 损坏、无 CSV、文件名日期非法时，会污染整批回测，
+  - 解决: 回测准确性优先，硬失败零容忍(`MAX_FAILED_FILES_TOLERATED=0`)，超阈值整批 `Err` 并报告失败数+留样路径；无日期形状/区间外文件仍意图内跳过
+  - 文件: `src/app/mod.rs`(`fail_on_hard_errors`)、`src/app/01_reader/binance.rs`、`src/app/01_reader/dukascopy.rs`
 - 当 dukascopy 年/月文件与起止区间部分重叠时，会整文件误杀，
   - 解决: 按 `[period_start, period_end)` 重叠判断，有交集即保留
   - 文件: `src/app/01_reader/dukascopy.rs`(`should_skip_file`)
@@ -130,9 +134,9 @@ tests/
 - 当序列有重复 bar 或缺口时，回测会压缩跳空、延迟信号，
   - 解决: 去重 keep-first + 缺口只报不改数(段数/缺数/留样 warn)，序列保持原样供复核
   - 文件: `src/app/02_clean.rs`，调用点 `src/app/mod.rs`
-- 当 `dir` 含非 UTF-8 路径时，会乱码拼接，
-  - 解决: 入口 `to_str` 失败直接 `Parse` 报错
-  - 文件: `src/app/mod.rs`
+- 当 `dir` 含非 UTF-8 路径时，
+  - 现状: Rust 入口以 `AsRef<Path>` 透传，已支持；仅 Python dict 入口要求 UTF-8 `String`
+  - 文件: `src/app/mod.rs`、`src/python.rs`
 - 当调用方沿用老配置(`symbol=[]` 数组 / `timeframes` 复数键 / `to_specs` / 内层 klines 路径 / 旧 dukascopy `{tf}` 目录命名)时，会反序列化失败或找不到目录，
   - 解决: 现行 `DataConfig` 为单品种单周期(`symbol: String` / `timeframe: String`)，`dir` 统一为数据根目录；老 `config.example.toml` 已更新，以本文为准
 
@@ -162,7 +166,7 @@ dir = "/data/nutilustrader/data" # 必填，数据根目录(程序按数据源�
 symbol = "BTCUSDT" # 必填，单品种
 timeframe = "1d" # 必填，单周期；binance "1m"~"1d"，dukascopy "M1"/"H1"/"D1"
 # start_date = "2024-01-01" # 可选，缺省无(全部数据)，格式 YYYY-MM-DD
-# end_date = "2024-12-31" # 可选，缺省无(全部数据)，格式 YYYY-MM-DD
+# end_date = "2024-12-31" # 可选，缺省无(全部数据)，格式 YYYY-MM-DD，含当日整天(UTC)
 ```
 
 - 老字段 `symbol=[]` 数组 / `timeframes` 复数键 / `to_specs()` 笛卡尔展开已废弃，以上为准。
@@ -175,13 +179,13 @@ timeframe = "1d" # 必填，单周期；binance "1m"~"1d"，dukascopy "M1"/"H1"/
   - `#[path]` 挂载编号模块，`pub use` 对外 API，内部 `Record`
 - config.rs
   - `DataConfig`：serde 反序列化目标兼加载入参(单品种×单周期)，含 `DataSource` 小写枚举(`type` 字段)
-  - 缺省：容器 `#[serde(default)]` + `Default`(Binance/空路径空串/None)，缺字段不断反序列化
-  - 校验：`validate()` 非空 + 分源白名单 + 日期格式/顺序，`load_columns` 入口调用，`ReaderError::Config`
+  - 缺省：仅 `start/end_date: Option` 缺省 None；必填字段缺失即反序列化失败
+  - 校验：`DataConfig::new`(fail-fast：非空 + 分源白名单 + 日期格式/顺序)，`ReaderError::Config`
 - error.rs
   - `ReaderError`(thiserror，non_exhaustive)：Io/Csv/Zip/Utf8/Parse
 - app/mod.rs
   - `load_columns(&DataConfig)` 唯一入口
-  - `dir` 转 str(失败 Parse 报错) → 按 source 分发管线 → `par_sort_by_key` 排序 → `clean_sorted` 去重+缺口检查打 warn → `KlineColumns::from`
+  - `dir` 以 `AsRef<Path>` 透传 → 按 source 分发管线 → 行级 UTC 裁剪 → `par_sort_by_key` 排序 → `clean_sorted` 去重+缺口检查打 warn → `KlineColumns::from`
 - app/01_reader/binance.rs
   - 扫 `{dir}/binance/data/um/daily/klines/{symbol}/{tf}/*.zip`，缺目录 `Io(NotFound)`
   - `extract_date_from_filename` + 字符串区间过滤(文件粒度)
