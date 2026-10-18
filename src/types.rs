@@ -31,6 +31,7 @@ const BINANCE_TIMEFRAMES: &[&str] = &[
 const DUKASCOPY_TIMEFRAMES: &[&str] = &["M1", "H1", "D1", "1m", "1h", "1d"];
 
 /// 间隔查询：未知周期返回 `None`，调用方决定跳过还是报错。
+#[must_use]
 pub fn interval_ms_for(timeframe: &str) -> Option<i64> {
     TIMEFRAME_INTERVALS_MS
         .iter()
@@ -38,6 +39,8 @@ pub fn interval_ms_for(timeframe: &str) -> Option<i64> {
         .map(|(_, ms)| *ms)
 }
 
+/// Whether `timeframe` is supported for `source`.
+#[must_use]
 pub fn is_supported(source: DataSource, timeframe: &str) -> bool {
     match source {
         DataSource::Binance => BINANCE_TIMEFRAMES.contains(&timeframe),
@@ -45,6 +48,8 @@ pub fn is_supported(source: DataSource, timeframe: &str) -> bool {
     }
 }
 
+/// List of timeframes supported for `source`.
+#[must_use]
 pub fn supported_timeframes(source: DataSource) -> &'static [&'static str] {
     match source {
         DataSource::Binance => BINANCE_TIMEFRAMES,
@@ -58,6 +63,7 @@ pub fn supported_timeframes(source: DataSource) -> &'static [&'static str] {
 pub struct Symbol(String);
 
 impl Symbol {
+    /// Parse and validate a symbol (non-empty after trimming).
     pub fn parse(s: impl AsRef<str>) -> Result<Self, ReaderError> {
         let trimmed = s.as_ref().trim();
         if trimmed.is_empty() {
@@ -66,6 +72,8 @@ impl Symbol {
         Ok(Self(trimmed.to_owned()))
     }
 
+    /// Borrow the inner symbol string.
+    #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -92,8 +100,9 @@ pub struct Timeframe {
 }
 
 impl Timeframe {
+    /// Parse and validate a timeframe for the given source.
     pub fn parse(source: DataSource, s: impl AsRef<str>) -> Result<Self, ReaderError> {
-        let s = s.as_ref();
+        let s = s.as_ref().trim();
         if !is_supported(source, s) {
             let name = match source {
                 DataSource::Binance => "binance",
@@ -113,11 +122,15 @@ impl Timeframe {
         })
     }
 
+    /// Borrow the raw timeframe string.
+    #[must_use]
     pub fn as_str(&self) -> &str {
         &self.raw
     }
 
-    pub fn interval_ms(&self) -> i64 {
+    /// Configured bar interval in milliseconds.
+    #[must_use]
+    pub const fn interval_ms(&self) -> i64 {
         self.interval_ms
     }
 }
@@ -159,5 +172,15 @@ mod tests {
         assert_eq!(interval_ms_for("M1"), Some(60_000));
         assert_eq!(interval_ms_for("1d"), Some(86_400_000));
         assert_eq!(interval_ms_for("3d"), None);
+    }
+
+    #[test]
+    fn supported_timeframes_per_source() {
+        assert!(is_supported(DataSource::Binance, "1m"));
+        assert!(!is_supported(DataSource::Binance, "D1"));
+        assert!(is_supported(DataSource::Dukascopy, "D1"));
+        assert!(!is_supported(DataSource::Dukascopy, "3m"));
+        assert!(supported_timeframes(DataSource::Binance).contains(&"1d"));
+        assert!(supported_timeframes(DataSource::Dukascopy).contains(&"M1"));
     }
 }

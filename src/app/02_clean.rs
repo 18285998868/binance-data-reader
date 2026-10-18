@@ -4,15 +4,18 @@
 //! - 缺口: 按 `Timeframe::interval_ms` 扫描, 缺段只上报不补价不切段.
 
 use crate::app::Record;
+#[cfg(test)]
 use crate::error::{ReaderError, Result};
-use crate::types::{self, Timeframe};
+#[cfg(test)]
+use crate::types;
+use crate::types::Timeframe;
 
 /// 缺口报告留样上限, 与 binance reader 的 `MAX_SKIP_SAMPLES` 同口径.
 const MAX_GAP_SAMPLES: usize = 5;
 
 /// 兼容旧字符串入口：查单一真相源 `types::interval_ms_for`。
 /// 新代码请直接用 `&Timeframe`（构造即带间隔，不会失败）。
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) fn interval_ms_for_timeframe(tf: &str) -> Result<i64> {
     types::interval_ms_for(tf)
         .ok_or_else(|| ReaderError::Parse(format!("unknown timeframe for gap check: {tf:?}")))
@@ -62,7 +65,7 @@ pub(crate) fn find_gaps(records: &[Record], interval_ms: i64) -> Vec<Gap> {
             gaps.push(Gap {
                 prev_time: w[0].open_time,
                 next_time: w[1].open_time,
-                missing_bars: diff / interval_ms - 1,
+                missing_bars: (diff / interval_ms - 1).max(0),
                 misaligned: diff % interval_ms != 0,
             });
         }

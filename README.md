@@ -144,13 +144,13 @@ tests/
 
 ```
 lib.rs            只做导出: pub mod app + mod config/error + pub use: KlineColumns / DataConfig / ReaderError / Result / load_columns / DataSource
-config.rs         # 支撑件: DataConfig(serde default + Default 空值 + validate: 非空/分源白名单/日期合法+顺序) + DataSource 小写枚举 + load_columns 入参(单品种×单周期)
+config.rs         # 支撑件: DataConfig(serde try_from RawDataConfig，构造即有效：非空/分源白名单/日期合法+顺序) + DataSource 小写枚举 + load_columns 入参(单品种×单周期)；无 Default（必填字段缺失即反序列化失败）
 error.rs          # 支撑件: ReaderError(Io/Csv/Zip/Utf8/Parse, non_exhaustive) + Result<T>，被各层引用
 test_helpers.rs   # 支撑件: cfg(test) create_test_zip(单测专用的合成 zip)
-app/mod.rs        # 入口 load_columns(&DataConfig): 先 validate → 按 source 分发到 01_reader 两管线 → 合并后 par_sort_by_key(open_time) 排序 → clean_sorted 去重+缺口检查 → KlineColumns::from(records); 内部 Record{open_time,o,h,l,c,v}
+app/mod.rs        # 入口 load_columns(&DataConfig): 配置构造即有效（无 validate）→ 按 source 分发到 01_reader 两管线 → 合并后行级 UTC 裁剪 → par_sort_by_key(open_time) 排序 → clean_sorted 去重+缺口检查 → KlineColumns::from(records); 内部 Record{open_time,o,h,l,c,v}
 app/01_reader/    # 被 mod 分发的加载(分支二选一)
-  binance.rs      # load_pipeline: 扫描 {dir}/binance/data/um/daily/klines/{symbol}/{tf}/*.zip → 按文件名日期做文件粒度过滤 → par 解压 zip 取 .csv → 表头自动判别 → 解析前 6 列; 坏行/坏文件 warn 跳过
-  dukascopy.rs    # load_dukascopy_pipeline: 递归扫描 {dir}/dukascopy/{symbol}/ 下 *.bi5 → 文件名 candles_* 匹配 timeframe + 路径年月日定周期起点 → 区间重叠过滤 → lzma 解压 → 24B 大端解析 → open_time = period_start + Δ; 损坏文件 warn 跳过
+  binance.rs      # load_pipeline: 扫描 {dir}/binance/data/um/daily/klines/{symbol}/{tf}/*.zip → 按文件名日期做文件粒度过过滤 → par 解压 zip 取 .csv → 表头自动判别 → 解析前 6 列; 坏行 warn 跳过并计数，坏文件（损坏 zip/无 CSV/非法文件名日期）零容忍整批 Err
+  dukascopy.rs    # load_dukascopy_pipeline: 递归扫描 {dir}/dukascopy/{symbol}/ 下 *.bi5 → 文件名 candles_* 匹配 timeframe + 路径年月日定周期起点 → 区间重叠过滤 → lzma 解压 → 24B 大端解析 → open_time = period_start + Δ; 坏行 warn 跳过并计数，坏文件（解压/解析失败/周期溢出）零容忍整批 Err
 app/02_clean.rs   # 清洗: dedup_sorted(keep-first) + find_gaps(缺口分段) + clean_sorted(一站式) + gap_samples(留样 5); 未知周期跳过检查; 要求输入已排序
 app/03_column.rs  # 收尾: KlineColumns{time,open,high,low,close,volume} + From<Vec<Record>> 列转置
 tests/
@@ -191,12 +191,12 @@ timeframe = "1d" # 必填，单周期；binance "1m"~"1d"，dukascopy "M1"/"H1"/
   - `extract_date_from_filename` + 字符串区间过滤(文件粒度)
   - `par_sort_unstable` + `par_iter` 并行解压解析
   - `load_single_zip` 取首个 csv → `parse_csv_bytes`(表头判别/flexible/坏行跳过+留样 5)
-  - 坏文件 warn 跳过，结束打 rows+elapsed
+  - 坏行 warn 跳过并计数；坏文件零容忍整批 `Err`，结束打 rows+elapsed
 - app/01_reader/dukascopy.rs
   - `walkdir` 递归扫 `{dir}/dukascopy/{symbol}/` 下 `*.bi5`，缺目录 `Io(NotFound)`
   - `kind_from_filename` 定 period kind + `parse_bi5_path` 校验 timeframe 一致并从路径年月日取起点 → `should_skip_file` 重叠过滤
   - `lzma_rs` 解压 → 24B 大端解析(`time_secs` + 价格/1e5 + 量) → `open_time=period_start+Δ`
-  - 坏文件 warn 跳过，结束打 rows+elapsed
+  - 坏行 warn 跳过并计数；坏文件零容忍整批 `Err`，结束打 rows+elapsed
 - app/03_column.rs
   - `From<Vec<Record>>` 列转置为等长 6 列
 - app/02_clean.rs

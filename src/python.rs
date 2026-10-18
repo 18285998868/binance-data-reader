@@ -75,3 +75,60 @@ pub(crate) fn py_load_columns(config: &Bound<'_, PyDict>) -> PyResult<Py<PyAny>>
         Ok(out.into())
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pyo3::types::PyDict;
+
+    #[test]
+    fn py_load_columns_missing_key_errors() {
+        Python::initialize();
+        Python::attach(|py| {
+            let cfg = PyDict::new(py);
+            let err = py_load_columns(&cfg).unwrap_err();
+            assert!(err.to_string().contains("missing required config key"));
+        });
+    }
+
+    #[test]
+    fn py_load_columns_invalid_type_errors() {
+        Python::initialize();
+        Python::attach(|py| {
+            let cfg = PyDict::new(py);
+            cfg.set_item("type", "nope").unwrap();
+            cfg.set_item("dir", "/tmp").unwrap();
+            cfg.set_item("symbol", "X").unwrap();
+            cfg.set_item("timeframe", "1d").unwrap();
+            let err = py_load_columns(&cfg).unwrap_err();
+            assert!(err.to_string().contains("unsupported type"));
+        });
+    }
+
+    #[test]
+    fn py_load_columns_loads_data() {
+        Python::initialize();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let data_dir = tmp.path().to_path_buf();
+        let kline_dir = data_dir.join("binance/data/um/daily/klines/X/1m");
+        std::fs::create_dir_all(&kline_dir).unwrap();
+        crate::test_helpers::create_test_zip(
+            &kline_dir,
+            "X-1m-2024-01-01.zip",
+            "100,10.0,12.0,9.0,11.0,1000.0,0,0,0,0,0,0\n",
+        );
+        Python::attach(|py| {
+            let cfg = PyDict::new(py);
+            cfg.set_item("type", "binance").unwrap();
+            cfg.set_item("dir", data_dir.to_str().unwrap()).unwrap();
+            cfg.set_item("symbol", "X").unwrap();
+            cfg.set_item("timeframe", "1m").unwrap();
+            let out = py_load_columns(&cfg).unwrap();
+            let out = out.bind(py);
+            let time: Vec<i64> = out.get_item("time").unwrap().extract().unwrap();
+            let close: Vec<f64> = out.get_item("close").unwrap().extract().unwrap();
+            assert_eq!(time.len(), 1);
+            assert!((close[0] - 11.0).abs() < 1e-9);
+        });
+    }
+}

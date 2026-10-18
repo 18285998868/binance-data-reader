@@ -1,5 +1,6 @@
 use thiserror::Error;
 
+/// Errors produced while loading kline data.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum ReaderError {
@@ -22,4 +23,5 @@ pub enum ReaderError {
     Parse(String),
 }
 
+/// Convenience alias for `std::result::Result<T, ReaderError>`.
 pub type Result<T> = std::result::Result<T, ReaderError>;

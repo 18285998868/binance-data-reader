@@ -89,7 +89,7 @@ fn trim_to_date_range(
     }
     let day_start_ms = |d: NaiveDate| {
         d.and_hms_opt(0, 0, 0)
-            .expect("NaiveDate always has midnight")
+            .expect("INVARIANT: NaiveDate always has a midnight instant")
             .and_utc()
             .timestamp_millis()
     };

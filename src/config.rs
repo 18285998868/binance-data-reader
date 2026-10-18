@@ -6,6 +6,7 @@ use serde::Deserialize;
 use crate::error::ReaderError;
 use crate::types::{Symbol, Timeframe};
 
+/// Supported kline data sources.
 #[derive(Debug, Clone, Copy, PartialEq, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DataSource {
@@ -19,6 +20,7 @@ pub enum DataSource {
 /// 不再静默 default 后报 confusing 的白名单错误；`Option` 日期缺省为 `None`。
 /// 公开仅为 `TryFrom` 目标，业务代码请用 `DataConfig::new`。
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawDataConfig {
     #[serde(rename = "type")]
     source_type: DataSource,

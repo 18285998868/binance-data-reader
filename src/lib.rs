@@ -1,3 +1,7 @@
+//! Load OHLCV kline data from local Binance/Dukascopy directories into column vectors.
+//!
+//! See the crate README for layout and configuration details.
+
 pub mod app;
 mod config;
 mod error;

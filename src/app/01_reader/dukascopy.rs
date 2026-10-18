@@ -209,14 +209,14 @@ fn parse_bi5_records(bytes: &[u8], period_start: NaiveDateTime) -> Result<(Vec<R
                 .map_err(|_| ReaderError::Parse("invalid bi5 field".into()))
         };
 
-        let time_secs = read_be_u32(0)? as i64;
+        let time_secs = i64::from(read_be_u32(0)?);
         // 字段序经实数据验证为 O,C,L,H（非 O,H,L,C）：365/365 满足 high/low 包络，
         // 且 |open[i+1]-close[i]| 均值 0.0002（反设为 0.0047）。旧代码 high/close 错位。
-        let open = read_be_u32(4)? as f64 / 100000.0;
-        let close = read_be_u32(8)? as f64 / 100000.0;
-        let low = read_be_u32(12)? as f64 / 100000.0;
-        let high = read_be_u32(16)? as f64 / 100000.0;
-        let volume = read_be_u32(20)? as f64;
+        let open = f64::from(read_be_u32(4)?) / 100_000.0;
+        let close = f64::from(read_be_u32(8)?) / 100_000.0;
+        let low = f64::from(read_be_u32(12)?) / 100_000.0;
+        let high = f64::from(read_be_u32(16)?) / 100_000.0;
+        let volume = f64::from(read_be_u32(20)?);
         if !super::is_valid_ohlc(open, high, low, close, volume) {
             skipped += 1;
             continue;
@@ -243,7 +243,7 @@ fn load_bi5_data(path: &Path, period_start: NaiveDate) -> Result<(Vec<Record>, u
     parse_bi5_records(&bytes, dt)
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 fn load_single_bi5(path: &Path) -> Result<Vec<Record>> {
     let name = path
         .file_name()
@@ -331,7 +331,12 @@ pub(crate) fn load_dukascopy_pipeline(
         })
         .filter(|e| e.file_type().is_file())
         .map(|e| e.into_path())
-        .filter(|path| path.extension().and_then(|s| s.to_str()) == Some("bi5"))
+        .filter(|path| {
+            path.extension()
+                .and_then(|s| s.to_str())
+                .map(|s| s.eq_ignore_ascii_case("bi5"))
+                .unwrap_or(false)
+        })
         .collect();
 
     paths.par_sort_unstable();

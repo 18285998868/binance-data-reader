@@ -164,7 +164,7 @@ fn row_snippet(row: &StringRecord, max_chars: usize) -> String {
 /// Returns the parsed records plus the rows that were skipped (with their line numbers).
 ///
 /// 边界：无换行单行按单行解析；首部空行跳过（只跳行，不丢文件）。
-fn parse_csv_bytes(bytes: &[u8]) -> Result<(Vec<Record>, SkippedRows)> {
+fn parse_csv_bytes(bytes: &[u8]) -> (Vec<Record>, SkippedRows) {
     // 跳过首部空行：行号基数同步后移，保证 warn 留样行号准确。
     let mut start = 0;
     let mut skipped_blank_lines = 0usize;
@@ -175,7 +175,7 @@ fn parse_csv_bytes(bytes: &[u8]) -> Result<(Vec<Record>, SkippedRows)> {
         start += 1;
     }
     if start >= bytes.len() {
-        return Ok((Vec::new(), SkippedRows::default()));
+        return (Vec::new(), SkippedRows::default());
     }
     let rest = &bytes[start..];
 
@@ -214,7 +214,7 @@ fn parse_csv_bytes(bytes: &[u8]) -> Result<(Vec<Record>, SkippedRows)> {
             }
         }
     }
-    Ok((records, skipped))
+    (records, skipped)
 }
 
 fn load_single_zip(path: &Path) -> Result<(Vec<Record>, usize)> {
@@ -238,7 +238,7 @@ fn load_single_zip(path: &Path) -> Result<(Vec<Record>, usize)> {
             path.display()
         )));
     };
-    let (records, skipped) = parse_csv_bytes(&bytes)?;
+    let (records, skipped) = parse_csv_bytes(&bytes);
     if skipped.count > 0 {
         tracing::warn!(
             path = %path.display(),
@@ -291,7 +291,12 @@ pub(crate) fn load_pipeline(
                 None
             }
         })
-        .filter(|path| path.extension().and_then(|s| s.to_str()) == Some("zip"))
+        .filter(|path| {
+            path.extension()
+                .and_then(|s| s.to_str())
+                .map(|s| s.eq_ignore_ascii_case("zip"))
+                .unwrap_or(false)
+        })
         .collect();
 
     paths.par_sort_unstable();
@@ -519,7 +524,7 @@ mod tests {
         ]
         .join("\n");
 
-        let (records, skipped) = parse_csv_bytes(csv.as_bytes()).unwrap();
+        let (records, skipped) = parse_csv_bytes(csv.as_bytes());
         assert_eq!(records.len(), 2);
         assert_eq!(records[0].open_time, 100);
         assert_eq!(records[1].open_time, 500);
@@ -536,7 +541,7 @@ mod tests {
         ]
         .join("\n");
 
-        let (records, skipped) = parse_csv_bytes(csv.as_bytes()).unwrap();
+        let (records, skipped) = parse_csv_bytes(csv.as_bytes());
         assert_eq!(records.len(), 1);
         assert_eq!(skipped.count, 2);
     }
@@ -552,7 +557,7 @@ mod tests {
         ]
         .join("\n");
 
-        let (records, skipped) = parse_csv_bytes(csv.as_bytes()).unwrap();
+        let (records, skipped) = parse_csv_bytes(csv.as_bytes());
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].open_time, 100);
         assert_eq!(skipped.count, 3);
@@ -561,7 +566,7 @@ mod tests {
     #[test]
     fn parse_with_header_skips_header() {
         let csv = format!("{HEADER12}\n100,10.0,12.0,9.0,11.0,1000.0,0,0,0,0,0,0\n");
-        let (records, skipped) = parse_csv_bytes(csv.as_bytes()).unwrap();
+        let (records, skipped) = parse_csv_bytes(csv.as_bytes());
         assert_eq!(records.len(), 1);
         assert_eq!(skipped.count, 0);
     }
@@ -570,7 +575,7 @@ mod tests {
     fn parse_single_line_without_trailing_newline() {
         // 单行文件无尾换行：整块即一行，必须解析而非丢文件。
         let csv = "100,10.0,12.0,9.0,11.0,1000.0,0,0,0,0,0,0";
-        let (records, skipped) = parse_csv_bytes(csv.as_bytes()).unwrap();
+        let (records, skipped) = parse_csv_bytes(csv.as_bytes());
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].open_time, 100);
         assert_eq!(skipped.count, 0);
@@ -578,7 +583,7 @@ mod tests {
 
     #[test]
     fn parse_header_only_without_trailing_newline_is_empty() {
-        let (records, skipped) = parse_csv_bytes(HEADER12.as_bytes()).unwrap();
+        let (records, skipped) = parse_csv_bytes(HEADER12.as_bytes());
         assert!(records.is_empty());
         assert_eq!(skipped.count, 0);
     }
@@ -587,7 +592,7 @@ mod tests {
     fn parse_leading_blank_lines_skipped() {
         // 首空行只跳行：好行保留，行号按绝对位置报。
         let csv = "\n\n100,10.0,12.0,9.0,11.0,1000.0,0,0,0,0,0,0\n";
-        let (records, skipped) = parse_csv_bytes(csv.as_bytes()).unwrap();
+        let (records, skipped) = parse_csv_bytes(csv.as_bytes());
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].open_time, 100);
         assert_eq!(skipped.count, 0);
@@ -596,7 +601,7 @@ mod tests {
     #[test]
     fn parse_numeric_first_field_header_drops_only_header_row() {
         let csv = "1,open,high,low,close,volume,close_time,quote_volume,count,taker_buy_volume,taker_buy_quote_volume,ignore\n100,10.0,12.0,9.0,11.0,1000.0,0,0,0,0,0,0\n";
-        let (records, skipped) = parse_csv_bytes(csv.as_bytes()).unwrap();
+        let (records, skipped) = parse_csv_bytes(csv.as_bytes());
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].open_time, 100);
         assert_eq!(skipped.count, 1);
