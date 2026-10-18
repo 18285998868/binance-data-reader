@@ -12,6 +12,35 @@ pub struct KlineColumns {
 }
 
 impl KlineColumns {
+    /// Construct validated, equal-length columns.
+    pub fn new(
+        time: Vec<i64>,
+        open: Vec<f64>,
+        high: Vec<f64>,
+        low: Vec<f64>,
+        close: Vec<f64>,
+        volume: Vec<f64>,
+    ) -> crate::error::Result<Self> {
+        if time.len() != open.len()
+            || time.len() != high.len()
+            || time.len() != low.len()
+            || time.len() != close.len()
+            || time.len() != volume.len()
+        {
+            return Err(crate::error::ReaderError::Config(
+                "kline columns must have equal length".into(),
+            ));
+        }
+        Ok(Self {
+            time,
+            open,
+            high,
+            low,
+            close,
+            volume,
+        })
+    }
+
     /// Bar open times in milliseconds.
     pub fn time(&self) -> &[i64] {
         &self.time
