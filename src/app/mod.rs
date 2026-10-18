@@ -120,32 +120,32 @@ fn trim_to_date_range(
 /// 全局排序在此显式执行: `clean` 要求输入已按 `open_time` 有序.
 pub fn load_columns(config: &DataConfig) -> Result<KlineColumns> {
     // `dir` 直接用 `Path`，支持非 UTF-8 路径（`api-impl-asref`）。
-    let records = match config.source_type {
+    let records = match config.source_type() {
         DataSource::Binance => binance::load_pipeline(
-            &config.dir,
-            &config.symbol,
-            &config.timeframe,
-            config.start_date,
-            config.end_date,
+            config.dir(),
+            config.symbol(),
+            config.timeframe(),
+            config.start_date(),
+            config.end_date(),
         )?,
         DataSource::Dukascopy => dukascopy::load_dukascopy_pipeline(
-            &config.dir,
-            &config.symbol,
-            &config.timeframe,
-            config.start_date,
-            config.end_date,
+            config.dir(),
+            config.symbol(),
+            config.timeframe(),
+            config.start_date(),
+            config.end_date(),
         )?,
     };
 
-    let mut records = trim_to_date_range(records, config.start_date, config.end_date);
+    let mut records = trim_to_date_range(records, config.start_date(), config.end_date());
     records.par_sort_by_key(|r| r.open_time);
 
     // 去重 + 缺口检查(只报不改数): 下游序列保持拼接原样, 报告供研究复核回测.
-    let (records, report) = clean::clean_sorted(records, &config.timeframe);
+    let (records, report) = clean::clean_sorted(records, config.timeframe());
     if report.dups_removed > 0 {
         tracing::warn!(
-            symbol = %config.symbol,
-            timeframe = %config.timeframe,
+            symbol = %config.symbol(),
+            timeframe = %config.timeframe(),
             dups_removed = report.dups_removed,
             "deduped duplicate bars by open_time (keep first)"
         );
@@ -153,8 +153,8 @@ pub fn load_columns(config: &DataConfig) -> Result<KlineColumns> {
     if !report.gaps.is_empty() {
         let missing_total: i64 = report.gaps.iter().map(|g| g.missing_bars.max(0)).sum();
         tracing::warn!(
-            symbol = %config.symbol,
-            timeframe = %config.timeframe,
+            symbol = %config.symbol(),
+            timeframe = %config.timeframe(),
             gap_segments = report.gaps.len(),
             missing_bars = missing_total,
             samples = ?clean::gap_samples(&report.gaps),

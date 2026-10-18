@@ -48,12 +48,38 @@ fn parse_opt_date(label: &str, v: Option<&str>) -> Result<Option<NaiveDate>, Rea
 #[derive(Debug, Clone, Deserialize)]
 #[serde(try_from = "RawDataConfig")]
 pub struct DataConfig {
-    pub source_type: DataSource,
-    pub dir: PathBuf,
-    pub symbol: Symbol,
-    pub timeframe: Timeframe,
-    pub start_date: Option<NaiveDate>,
-    pub end_date: Option<NaiveDate>,
+    source_type: DataSource,
+    dir: PathBuf,
+    symbol: Symbol,
+    timeframe: Timeframe,
+    start_date: Option<NaiveDate>,
+    end_date: Option<NaiveDate>,
+}
+
+impl DataConfig {
+    pub fn source_type(&self) -> DataSource {
+        self.source_type
+    }
+
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    pub fn symbol(&self) -> &Symbol {
+        &self.symbol
+    }
+
+    pub fn timeframe(&self) -> &Timeframe {
+        &self.timeframe
+    }
+
+    pub fn start_date(&self) -> Option<NaiveDate> {
+        self.start_date
+    }
+
+    pub fn end_date(&self) -> Option<NaiveDate> {
+        self.end_date
+    }
 }
 
 impl DataConfig {

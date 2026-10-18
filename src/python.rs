@@ -66,12 +66,12 @@ pub(crate) fn py_load_columns(config: &Bound<'_, PyDict>) -> PyResult<Py<PyAny>>
     let cols = crate::app::load_columns(&data_cfg).map_err(py_err)?;
     Python::attach(|py| {
         let out = PyDict::new(py);
-        out.set_item("time", &cols.time)?;
-        out.set_item("open", &cols.open)?;
-        out.set_item("high", &cols.high)?;
-        out.set_item("low", &cols.low)?;
-        out.set_item("close", &cols.close)?;
-        out.set_item("volume", &cols.volume)?;
+        out.set_item("time", cols.time())?;
+        out.set_item("open", cols.open())?;
+        out.set_item("high", cols.high())?;
+        out.set_item("low", cols.low())?;
+        out.set_item("close", cols.close())?;
+        out.set_item("volume", cols.volume())?;
         Ok(out.into())
     })
 }
@@ -102,6 +102,20 @@ mod tests {
             cfg.set_item("timeframe", "1d").unwrap();
             let err = py_load_columns(&cfg).unwrap_err();
             assert!(err.to_string().contains("unsupported type"));
+        });
+    }
+
+    #[test]
+    fn py_load_columns_invalid_timeframe_errors() {
+        Python::initialize();
+        Python::attach(|py| {
+            let cfg = PyDict::new(py);
+            cfg.set_item("type", "binance").unwrap();
+            cfg.set_item("dir", "/tmp").unwrap();
+            cfg.set_item("symbol", "X").unwrap();
+            cfg.set_item("timeframe", "3d").unwrap();
+            let err = py_load_columns(&cfg).unwrap_err();
+            assert!(err.to_string().contains("unsupported"));
         });
     }
 

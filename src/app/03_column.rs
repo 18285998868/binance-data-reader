@@ -3,18 +3,44 @@ use crate::app::Record;
 /// Column-oriented OHLCV output.
 #[derive(Debug, Clone)]
 pub struct KlineColumns {
+    time: Vec<i64>,
+    open: Vec<f64>,
+    high: Vec<f64>,
+    low: Vec<f64>,
+    close: Vec<f64>,
+    volume: Vec<f64>,
+}
+
+impl KlineColumns {
     /// Bar open times in milliseconds.
-    pub time: Vec<i64>,
+    pub fn time(&self) -> &[i64] {
+        &self.time
+    }
+
     /// Open prices.
-    pub open: Vec<f64>,
+    pub fn open(&self) -> &[f64] {
+        &self.open
+    }
+
     /// High prices.
-    pub high: Vec<f64>,
+    pub fn high(&self) -> &[f64] {
+        &self.high
+    }
+
     /// Low prices.
-    pub low: Vec<f64>,
+    pub fn low(&self) -> &[f64] {
+        &self.low
+    }
+
     /// Close prices.
-    pub close: Vec<f64>,
+    pub fn close(&self) -> &[f64] {
+        &self.close
+    }
+
     /// Volumes.
-    pub volume: Vec<f64>,
+    pub fn volume(&self) -> &[f64] {
+        &self.volume
+    }
 }
 
 impl KlineColumns {

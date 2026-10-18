@@ -37,8 +37,8 @@ fn integration_global_sort_when_filename_order_conflicts() {
     let spec = cfg(DataSource::Binance, data_dir, "T", "1m", None, None);
     let cols = load_columns(&spec).unwrap();
     assert_eq!(cols.len(), 2);
-    assert_eq!(cols.time[0], 1704067140000);
-    assert_eq!(cols.time[1], 1704067200000);
+    assert_eq!(cols.time()[0], 1704067140000);
+    assert_eq!(cols.time()[1], 1704067200000);
 }
 
 #[test]
@@ -72,10 +72,10 @@ fn integration_load_multiple_days() {
     );
     let cols = load_columns(&spec).unwrap();
     assert_eq!(cols.len(), 2);
-    assert_eq!(cols.time[0], 1704067200000);
-    assert_eq!(cols.time[1], 1704153600000);
-    assert!((cols.close[0] - 42331.9).abs() < 0.001);
-    assert!((cols.close[1] - 42550.0).abs() < 0.001);
+    assert_eq!(cols.time()[0], 1704067200000);
+    assert_eq!(cols.time()[1], 1704153600000);
+    assert!((cols.close()[0] - 42331.9).abs() < 0.001);
+    assert!((cols.close()[1] - 42550.0).abs() < 0.001);
 }
 
 #[test]
@@ -139,9 +139,9 @@ fn integration_all_data_when_no_date_filter() {
     let spec = cfg(DataSource::Binance, data_dir, "SOLUSDT", "1m", None, None);
     let cols = load_columns(&spec).unwrap();
     assert_eq!(cols.len(), 3);
-    assert_eq!(cols.time[0], 1704067200000);
-    assert_eq!(cols.time[1], 1704067260000);
-    assert_eq!(cols.time[2], 1704153600000);
+    assert_eq!(cols.time()[0], 1704067200000);
+    assert_eq!(cols.time()[1], 1704067260000);
+    assert_eq!(cols.time()[2], 1704153600000);
 }
 
 #[test]
@@ -170,10 +170,10 @@ timeframe = "1h"
     let cfg: DataConfig = toml::from_str(&toml_str).unwrap();
     let cols = load_columns(&cfg).unwrap();
     assert_eq!(cols.len(), 2);
-    assert_eq!(cols.time[0], 1704067200000);
-    assert!((cols.close[0] - 3005.0).abs() < 0.001);
-    assert_eq!(cols.time[1], 1704070800000);
-    assert!((cols.close[1] - 3015.0).abs() < 0.001);
+    assert_eq!(cols.time()[0], 1704067200000);
+    assert!((cols.close()[0] - 3005.0).abs() < 0.001);
+    assert_eq!(cols.time()[1], 1704070800000);
+    assert!((cols.close()[1] - 3015.0).abs() < 0.001);
 }
 
 #[test]
@@ -204,6 +204,6 @@ timeframe = "1d"
     let cfg: DataConfig = toml::from_str(&toml_str).unwrap();
     let cols = load_columns(&cfg).unwrap();
     assert_eq!(cols.len(), 2);
-    assert_eq!(cols.time[0], 1704067200000);
-    assert_eq!(cols.time[1], 1704153600000);
+    assert_eq!(cols.time()[0], 1704067200000);
+    assert_eq!(cols.time()[1], 1704153600000);
 }
