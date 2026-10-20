@@ -15,7 +15,7 @@ pub use app::{KlineColumns, load_columns};
 pub use config::{DataConfig, DataSource};
 pub use error::{ReaderError, Result};
 use pyo3::prelude::*;
-pub use types::{Symbol, Timeframe};
+pub use types::{Symbol, Timeframe, is_supported, supported_timeframes};
 
 /// Python extension module (`maturin build` → `import kline_reader`).
 #[pymodule]
