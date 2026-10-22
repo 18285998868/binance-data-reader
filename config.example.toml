@@ -1,15 +1,18 @@
 # 配置说明: 全部字段以小写字母开头
 #
 # 目录约定 (重要): dir 是数据**根目录**, 程序按数据源自动追加子路径,
-#   binance:   {dir}/binance/data/um/daily/klines/{symbol}/{timeframe}/*.zip (zip 内含 {symbol}-{tf}-{YYYY-MM-DD}.csv, Binance 官方 12 列取前 6)
+#   binance:   {dir}/binance/data/{market}/daily/klines/{symbol}/{timeframe}/*.zip
+#             market = "spot" | "futures/um" | "futures/cm", 默认 "futures/um"
+#             (zip 内含 {symbol}-{tf}-{YYYY-MM-DD}.csv, Binance 官方 12 列取前 6)
 #   dukascopy: {dir}/dukascopy/{symbol}/{YYYY}[/{MM}[/{DD}]]/{BID|ASK}_candles_{min_1|hour_1|day_1}.bi5 (官方镜像布局, LZMA 压缩, 每记录 24 字节大端)
 # 因此不要把子路径写进 dir, 否则会找不到目录:
-#   错误: dir = "/data/nutilustrader/data/binance/data/um/daily/klines"
+#   错误: dir = "/data/nutilustrader/data/binance/data/futures/um/daily/klines"
 #   正确: dir = "/data/nutilustrader/data"
 #
 # 单品种单周期: 一个文件只描述一对 symbol/timeframe, 多品种请写多个文件或调多次 load_columns.
 # 日期语义均为 UTC; end_date 含当日整天.
 type = "binance" # 数据源类型, 必填, 可选参数: "binance" | "dukascopy"
+market = "futures/um" # Binance 市场, 可选, 默认 futures/um; 可选: spot | futures/um | futures/cm (兼容 um/cm)
 dir = "/data/nutilustrader/data" # K线数据根目录, 必填
 symbol = "BTCUSDT" # 品种, 必填, 单值
 timeframe = "1d" # 时间帧, 必填, 单值; binance: "1m"~"1d", dukascopy: "M1"/"H1"/"D1" (另兼容 "1m"/"1h"/"1d")

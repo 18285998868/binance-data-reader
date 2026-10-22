@@ -1,14 +1,15 @@
 //! Python bindings (`pyo3`, abi3): thin `load_columns(dict) -> dict` wrapper.
 //!
-//! The dict mirrors `DataConfig` (`type/dir/symbol/timeframe/start_date/end_date`)
-//! and returns `{time, open, high, low, close, volume}` column lists.
+//! The dict mirrors `DataConfig`
+//! (`type/dir/market/symbol/timeframe/start_date/end_date`) and returns
+//! `{time, open, high, low, close, volume}` column lists.
 //! 解析在边界一次完成（`DataConfig::new`），非法输入直接报 `ValueError`。
 
 use pyo3::exceptions::{PyKeyError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
-use crate::config::{DataConfig, DataSource};
+use crate::config::{DataConfig, DataSource, Market};
 use crate::error::ReaderError;
 
 fn py_err(e: ReaderError) -> PyErr {
@@ -50,18 +51,34 @@ pub(crate) fn py_load_columns(config: &Bound<'_, PyDict>) -> PyResult<Py<PyAny>>
         }
     };
     let dir: String = extract_required(config, "dir")?;
+    let market: Option<String> = extract_optional(config, "market")?;
     let symbol: String = extract_required(config, "symbol")?;
     let timeframe: String = extract_required(config, "timeframe")?;
     let start_date: Option<String> = extract_optional(config, "start_date")?;
     let end_date: Option<String> = extract_optional(config, "end_date")?;
-    let data_cfg = DataConfig::new(
-        source_type,
-        &dir,
-        &symbol,
-        &timeframe,
-        start_date.as_deref(),
-        end_date.as_deref(),
-    )
+    let market = match market.as_deref() {
+        Some(raw) => Some(raw.parse::<Market>().map_err(PyValueError::new_err)?),
+        None => None,
+    };
+    let data_cfg = match market {
+        Some(market) => DataConfig::new_with_market(
+            source_type,
+            market,
+            &dir,
+            &symbol,
+            &timeframe,
+            start_date.as_deref(),
+            end_date.as_deref(),
+        ),
+        None => DataConfig::new(
+            source_type,
+            &dir,
+            &symbol,
+            &timeframe,
+            start_date.as_deref(),
+            end_date.as_deref(),
+        ),
+    }
     .map_err(|e| PyValueError::new_err(e.to_string()))?;
     let cols = crate::app::load_columns(&data_cfg).map_err(py_err)?;
     Python::attach(|py| {
@@ -124,7 +141,7 @@ mod tests {
         Python::initialize();
         let tmp = tempfile::TempDir::new().unwrap();
         let data_dir = tmp.path().to_path_buf();
-        let kline_dir = data_dir.join("binance/data/um/daily/klines/X/1m");
+        let kline_dir = data_dir.join("binance/data/futures/um/daily/klines/X/1m");
         std::fs::create_dir_all(&kline_dir).unwrap();
         crate::test_helpers::create_test_zip(
             &kline_dir,
@@ -143,6 +160,48 @@ mod tests {
             let close: Vec<f64> = out.get_item("close").unwrap().extract().unwrap();
             assert_eq!(time.len(), 1);
             assert!((close[0] - 11.0).abs() < 1e-9);
+        });
+    }
+
+    #[test]
+    fn py_load_columns_spot_market() {
+        Python::initialize();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let data_dir = tmp.path().to_path_buf();
+        let kline_dir = data_dir.join("binance/data/spot/daily/klines/X/1m");
+        std::fs::create_dir_all(&kline_dir).unwrap();
+        crate::test_helpers::create_test_zip(
+            &kline_dir,
+            "X-1m-2024-01-01.zip",
+            "100,20.0,22.0,19.0,21.0,1000.0,0,0,0,0,0,0\n",
+        );
+        Python::attach(|py| {
+            let cfg = PyDict::new(py);
+            cfg.set_item("type", "binance").unwrap();
+            cfg.set_item("market", "spot").unwrap();
+            cfg.set_item("dir", data_dir.to_str().unwrap()).unwrap();
+            cfg.set_item("symbol", "X").unwrap();
+            cfg.set_item("timeframe", "1m").unwrap();
+            let out = py_load_columns(&cfg).unwrap();
+            let out = out.bind(py);
+            let close: Vec<f64> = out.get_item("close").unwrap().extract().unwrap();
+            assert_eq!(close.len(), 1);
+            assert!((close[0] - 21.0).abs() < 1e-9);
+        });
+    }
+
+    #[test]
+    fn py_load_columns_invalid_market_errors() {
+        Python::initialize();
+        Python::attach(|py| {
+            let cfg = PyDict::new(py);
+            cfg.set_item("type", "binance").unwrap();
+            cfg.set_item("market", "nope").unwrap();
+            cfg.set_item("dir", "/tmp").unwrap();
+            cfg.set_item("symbol", "X").unwrap();
+            cfg.set_item("timeframe", "1d").unwrap();
+            let err = py_load_columns(&cfg).unwrap_err();
+            assert!(err.to_string().contains("unsupported market"));
         });
     }
 }

@@ -5,7 +5,7 @@
 > 从本地 K 线数据目录加载 OHLCV 为列向量(`KlineColumns`)，供回测/策略使用
 > 数据布局(`dir` 为数据根目录，与两下载器 `output_dir` 一致):
 
-- `{dir}/binance/data/um/daily/klines/{symbol}/{timeframe}/*.zip` (Binance): 每个 zip 内含一个 `{symbol}-{tf}-{YYYY-MM-DD}.csv`(Binance 官方 12 列，取前 6 列)，按日分文件
+- `{dir}/binance/data/{market}/daily/klines/{symbol}/{timeframe}/*.zip` (Binance; `market` = `spot` | `futures/um` | `futures/cm`，默认 `futures/um`): 每个 zip 内含一个 `{symbol}-{tf}-{YYYY-MM-DD}.csv`(Binance 官方 12 列，取前 6 列)，按日分文件
 - `{dir}/dukascopy/{symbol}/{YYYY}[/{MM}[/{DD}]]/{PRICE}_{candles_*}.bi5` (Dukascopy, 官方镜像布局): LZMA 压缩二进制，每记录 24 字节大端；D1 按年(`{YYYY}/BID_candles_day_1.bi5`) / H1 按月(`{YYYY}/{MM}/BID_candles_hour_1.bi5`) / M1 按天(`{YYYY}/{MM}/{DD}/BID_candles_min_1.bi5`)
 - 调用方: vta / run-backtest-node 等通过 `kline-reader` workspace path 依赖接入，流程为 `DataConfig`(toml)→ `load_columns(&cfg)`
 
@@ -18,6 +18,7 @@
 
 ```toml
 type = "binance" # 必填
+market = "futures/um" # 可选，默认 futures/um；可选 spot | futures/um | futures/cm
 dir = "/data/nutilustrader/data" # 必填，数据根目录(程序按数据源自动追加子路径)
 symbol = "BTCUSDT" # 必填，单品种
 timeframe = "1d" # 必填，单周期；binance "1m"~"1d"，dukascopy "M1"/"H1"/"D1"
@@ -35,7 +36,7 @@ let cols: KlineColumns = load_columns(&cfg)?; // 内部已按 open_time 全局�
 ```
 调用方          提供 DataConfig(toml) 反序列化
 app/mod.rs      入口 load_columns(&cfg)：配置读取&校验 -> 按 source 分发单条管线 -> 加载数据 -> 全局排序 -> clean -> 列转置
-                01_reader/binance.rs   -> 扫描 {dir}/binance/data/um/daily/klines/{symbol}/{tf}/*.zip → 文件名日期过滤 → par 解压取 .csv → 表头判别 → 解析前 6 列，坏行跳过
+                01_reader/binance.rs   -> 扫描 {dir}/binance/data/{market}/daily/klines/{symbol}/{tf}/*.zip → 文件名日期过滤 → par 解压取 .csv → 表头判别 → 解析前 6 列，坏行跳过
                 01_reader/dukascopy.rs -> 递归扫描 {dir}/dukascopy/{symbol}/ 下 *.bi5 → 文件名 candles_* 匹配 timeframe + 路径年月日定周期 → 区间重叠过滤 → lzma 解压 → 24B 大端解析
                 合并 records -> par_sort_by_key(open_time) 全局排序(clean 要求输入有序)
 02_clean        去重 keep-first + 缺口检查(只报不改数)
@@ -89,7 +90,7 @@ tests/
 
 ### 01_reader/binance
 
-1. 扫描 `{dir}/binance/data/um/daily/klines/{symbol}/{tf}/*.zip`；目录不存在返 `Io(NotFound)` 带路径。
+1. 扫描 `{dir}/binance/data/{market}/daily/klines/{symbol}/{tf}/*.zip`；目录不存在返 `Io(NotFound)` 带路径。
 2. 文件名取 stem 末 10 字符做日期形状校验(`YYYY-MM-DD`)，合法才做字符串区间过滤；形状像日期但非法(如 2024-13-01)直接 `Parse` 报错跳过该文件。
 3. `par_sort_unstable` 排路径，`par_iter` 并行解压解析。
 4. 单 zip 取首个 `.csv`(大小写不敏感)，无 csv 即 `Parse` 报错跳过该文件。
@@ -139,17 +140,19 @@ tests/
   - 文件: `src/app/mod.rs`、`src/python.rs`
 - 当调用方沿用老配置(`symbol=[]` 数组 / `timeframes` 复数键 / `to_specs` / 内层 klines 路径 / 旧 dukascopy `{tf}` 目录命名)时，会反序列化失败或找不到目录，
   - 解决: 现行 `DataConfig` 为单品种单周期(`symbol: String` / `timeframe: String`)，`dir` 统一为数据根目录；老 `config.example.toml` 已更新，以本文为准
+- 当读取 spot / CM 数据却未设置 `market` 时，会按默认 `futures/um` 查找目录，
+  - 解决: 显式设置 `market = "spot"` 或 `market = "futures/cm"`；`futures/um` 可省略
 
 ## 完整架构
 
 ```
-lib.rs            只做导出: pub mod app + mod config/error + pub use: KlineColumns / DataConfig / ReaderError / Result / load_columns / DataSource
-config.rs         # 支撑件: DataConfig(serde try_from RawDataConfig，构造即有效：非空/分源白名单/日期合法+顺序) + DataSource 小写枚举 + load_columns 入参(单品种×单周期)；无 Default（必填字段缺失即反序列化失败）
+lib.rs            只做导出: pub mod app + mod config/error + pub use: KlineColumns / DataConfig / ReaderError / Result / load_columns / DataSource / Market
+config.rs         # 支撑件: DataConfig(serde try_from RawDataConfig，构造即有效：非空/分源白名单/日期合法+顺序) + DataSource 小写枚举 + Binance Market(spot/futures/um/futures/cm) + load_columns 入参(单品种×单周期)；无 Default（必填字段缺失即反序列化失败）
 error.rs          # 支撑件: ReaderError(Io/Csv/Zip/Utf8/Parse, non_exhaustive) + Result<T>，被各层引用
 test_helpers.rs   # 支撑件: cfg(test) create_test_zip(单测专用的合成 zip)
 app/mod.rs        # 入口 load_columns(&DataConfig): 配置构造即有效（无 validate）→ 按 source 分发到 01_reader 两管线 → 合并后行级 UTC 裁剪 → par_sort_by_key(open_time) 排序 → clean_sorted 去重+缺口检查 → KlineColumns::from(records); 内部 Record{open_time,o,h,l,c,v}
 app/01_reader/    # 被 mod 分发的加载(分支二选一)
-  binance.rs      # load_pipeline: 扫描 {dir}/binance/data/um/daily/klines/{symbol}/{tf}/*.zip → 按文件名日期做文件粒度过过滤 → par 解压 zip 取 .csv → 表头自动判别 → 解析前 6 列; 坏行 warn 跳过并计数，坏文件（损坏 zip/无 CSV/非法文件名日期）零容忍整批 Err
+  binance.rs      # load_pipeline: 扫描 {dir}/binance/data/{market}/daily/klines/{symbol}/{tf}/*.zip → 按文件名日期做文件粒度过过滤 → par 解压 zip 取 .csv → 表头自动判别 → 解析前 6 列; 坏行 warn 跳过并计数，坏文件（损坏 zip/无 CSV/非法文件名日期）零容忍整批 Err
   dukascopy.rs    # load_dukascopy_pipeline: 递归扫描 {dir}/dukascopy/{symbol}/ 下 *.bi5 → 文件名 candles_* 匹配 timeframe + 路径年月日定周期起点 → 区间重叠过滤 → lzma 解压 → 24B 大端解析 → open_time = period_start + Δ; 坏行 warn 跳过并计数，坏文件（解压/解析失败/周期溢出）零容忍整批 Err
 app/02_clean.rs   # 清洗: dedup_sorted(keep-first) + find_gaps(缺口分段) + clean_sorted(一站式) + gap_samples(留样 5); 未知周期跳过检查; 要求输入已排序
 app/03_column.rs  # 收尾: KlineColumns{time,open,high,low,close,volume} + From<Vec<Record>> 列转置
@@ -162,6 +165,7 @@ tests/
 
 ```toml
 type = "binance" # 必填，可选 "binance" | "dukascopy"
+market = "futures/um" # 可选，默认 futures/um；可选 spot | futures/um | futures/cm
 dir = "/data/nutilustrader/data" # 必填，数据根目录(程序按数据源自动追加子路径)
 symbol = "BTCUSDT" # 必填，单品种
 timeframe = "1d" # 必填，单周期；binance "1m"~"1d"，dukascopy "M1"/"H1"/"D1"
@@ -178,16 +182,16 @@ timeframe = "1d" # 必填，单周期；binance "1m"~"1d"，dukascopy "M1"/"H1"/
   - 只做导出
   - `#[path]` 挂载编号模块，`pub use` 对外 API，内部 `Record`
 - config.rs
-  - `DataConfig`：serde 反序列化目标兼加载入参(单品种×单周期)，含 `DataSource` 小写枚举(`type` 字段)
-  - 缺省：仅 `start/end_date: Option` 缺省 None；必填字段缺失即反序列化失败
-  - 校验：`DataConfig::new`(fail-fast：非空 + 分源白名单 + 日期格式/顺序)，`ReaderError::Config`
+  - `DataConfig`：serde 反序列化目标兼加载入参(单品种×单周期)，含 `DataSource` 小写枚举(`type` 字段) 与 `Market`(`market` 字段，默认 `futures/um`)
+  - 缺省：仅 `market` 与 `start/end_date` 有缺省；必填字段缺失即反序列化失败
+  - 校验：`DataConfig::new` / `new_with_market`(fail-fast：非空 + 分源白名单 + 日期格式/顺序；`market` 仅限 binance)，`ReaderError::Config`
 - error.rs
   - `ReaderError`(thiserror，non_exhaustive)：Io/Csv/Zip/Utf8/Parse
 - app/mod.rs
   - `load_columns(&DataConfig)` 唯一入口
   - `dir` 以 `AsRef<Path>` 透传 → 按 source 分发管线 → 行级 UTC 裁剪 → `par_sort_by_key` 排序 → `clean_sorted` 去重+缺口检查打 warn → `KlineColumns::from`
 - app/01_reader/binance.rs
-  - 扫 `{dir}/binance/data/um/daily/klines/{symbol}/{tf}/*.zip`，缺目录 `Io(NotFound)`
+  - 扫 `{dir}/binance/data/{market}/daily/klines/{symbol}/{tf}/*.zip`，缺目录 `Io(NotFound)`
   - `extract_date_from_filename` + 字符串区间过滤(文件粒度)
   - `par_sort_unstable` + `par_iter` 并行解压解析
   - `load_single_zip` 取首个 csv → `parse_csv_bytes`(表头判别/flexible/坏行跳过+留样 5)
@@ -216,7 +220,7 @@ uvx maturin build # 产物 target/wheels/*cp39-abi3*.whl，>=3.9 通用
 ```python
 import kline_reader
 cols = kline_reader.load_columns({ # dict 同 DataConfig 字段，非法直接报错
-    "type": "binance", "dir": "/data/nutilustrader/data",
+    "type": "binance", "market": "futures/um", "dir": "/data/nutilustrader/data",
     "symbol": "BTCUSDT", "timeframe": "1d",
     "start_date": "2024-01-01", "end_date": "2024-01-03",
 })

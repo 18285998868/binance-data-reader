@@ -2,7 +2,7 @@ use std::path::Path;
 
 use tempfile::TempDir;
 
-use kline_reader::{DataConfig, DataSource, load_columns};
+use kline_reader::{DataConfig, DataSource, Market, load_columns};
 
 fn cfg(
     source: DataSource,
@@ -15,6 +15,10 @@ fn cfg(
     DataConfig::new(source, &dir, symbol, tf, start, end).unwrap()
 }
 
+fn cfg_with_market(market: Market, dir: std::path::PathBuf, symbol: &str, tf: &str) -> DataConfig {
+    DataConfig::new_with_market(DataSource::Binance, market, &dir, symbol, tf, None, None).unwrap()
+}
+
 mod common;
 
 use common::create_test_zip;
@@ -24,7 +28,7 @@ fn integration_global_sort_when_filename_order_conflicts() {
     let tmp = TempDir::new().unwrap();
     let data_dir = tmp.path().join("data");
     let kline_dir = data_dir
-        .join("binance/data/um/daily/klines")
+        .join("binance/data/futures/um/daily/klines")
         .join("T")
         .join("1m");
     std::fs::create_dir_all(&kline_dir).unwrap();
@@ -46,7 +50,7 @@ fn integration_load_multiple_days() {
     let tmp = TempDir::new().unwrap();
     let data_dir = tmp.path().join("data");
     let kline_dir = data_dir
-        .join("binance/data/um/daily/klines")
+        .join("binance/data/futures/um/daily/klines")
         .join("BTCUSDT")
         .join("1m");
     std::fs::create_dir_all(&kline_dir).unwrap();
@@ -83,7 +87,7 @@ fn integration_load_empty_range() {
     let tmp = TempDir::new().unwrap();
     let data_dir = tmp.path().join("data");
     let kline_dir = data_dir
-        .join("binance/data/um/daily/klines")
+        .join("binance/data/futures/um/daily/klines")
         .join("ETHUSDT")
         .join("1m");
     std::fs::create_dir_all(&kline_dir).unwrap();
@@ -126,7 +130,7 @@ fn integration_all_data_when_no_date_filter() {
     let tmp = TempDir::new().unwrap();
     let data_dir = tmp.path().join("data");
     let kline_dir = data_dir
-        .join("binance/data/um/daily/klines")
+        .join("binance/data/futures/um/daily/klines")
         .join("SOLUSDT")
         .join("1m");
     std::fs::create_dir_all(&kline_dir).unwrap();
@@ -149,7 +153,7 @@ fn integration_full_flow_toml_to_columns() {
     let tmp = TempDir::new().unwrap();
     let kline_dir = tmp
         .path()
-        .join("binance/data/um/daily/klines")
+        .join("binance/data/futures/um/daily/klines")
         .join("ETHUSDT")
         .join("1h");
     std::fs::create_dir_all(&kline_dir).unwrap();
@@ -181,7 +185,7 @@ fn integration_full_flow_toml_with_date_filter() {
     let tmp = TempDir::new().unwrap();
     let kline_dir = tmp
         .path()
-        .join("binance/data/um/daily/klines")
+        .join("binance/data/futures/um/daily/klines")
         .join("XRPUSDT")
         .join("1d");
     std::fs::create_dir_all(&kline_dir).unwrap();
@@ -206,4 +210,49 @@ timeframe = "1d"
     assert_eq!(cols.len(), 2);
     assert_eq!(cols.time()[0], 1704067200000);
     assert_eq!(cols.time()[1], 1704153600000);
+}
+
+#[test]
+fn integration_binance_market_paths() {
+    for market in [Market::Spot, Market::Um, Market::Cm] {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        let kline_dir = data_dir
+            .join("binance/data")
+            .join(market.as_path())
+            .join("daily/klines/X/1m");
+        std::fs::create_dir_all(&kline_dir).unwrap();
+        let csv = "1704067200000,10.0,12.0,9.0,11.0,1000.0,0,0,0,0,0,0\n";
+        create_test_zip(&kline_dir, "X-1m-2024-01-01.zip", csv);
+
+        let cols = load_columns(&cfg_with_market(market, data_dir, "X", "1m")).unwrap();
+        assert_eq!(cols.len(), 1, "market {market}");
+        assert!((cols.close()[0] - 11.0).abs() < 1e-9);
+    }
+}
+
+#[test]
+fn integration_toml_market_spot() {
+    let tmp = TempDir::new().unwrap();
+    let kline_dir = tmp.path().join("binance/data/spot/daily/klines/X/1m");
+    std::fs::create_dir_all(&kline_dir).unwrap();
+    let csv = "1704067200000,20.0,22.0,19.0,21.0,1000.0,0,0,0,0,0,0\n";
+    create_test_zip(&kline_dir, "X-1m-2024-01-01.zip", csv);
+
+    let toml_str = format!(
+        r#"
+type = "binance"
+market = "spot"
+dir = "{}"
+symbol = "X"
+timeframe = "1m"
+"#,
+        tmp.path().to_str().unwrap()
+    );
+
+    let cfg: DataConfig = toml::from_str(&toml_str).unwrap();
+    assert_eq!(cfg.market(), Market::Spot);
+    let cols = load_columns(&cfg).unwrap();
+    assert_eq!(cols.len(), 1);
+    assert!((cols.close()[0] - 21.0).abs() < 1e-9);
 }

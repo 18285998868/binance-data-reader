@@ -7,6 +7,7 @@ use csv::StringRecord;
 use rayon::prelude::*;
 
 use crate::app::Record;
+use crate::config::Market;
 use crate::error::{ReaderError, Result};
 use crate::types::{Symbol, Timeframe};
 
@@ -251,9 +252,10 @@ fn load_single_zip(path: &Path) -> Result<(Vec<Record>, usize)> {
 }
 
 /// Scan directory for matching zip files, parse them (in parallel), and merge into sorted Records.
-#[tracing::instrument(skip_all, fields(symbol, timeframe))]
+#[tracing::instrument(skip_all, fields(market = %market, symbol, timeframe))]
 pub(crate) fn load_pipeline(
     dir: impl AsRef<Path>,
+    market: Market,
     symbol: &Symbol,
     timeframe: &Timeframe,
     start_date: Option<NaiveDate>,
@@ -261,15 +263,19 @@ pub(crate) fn load_pipeline(
 ) -> Result<Vec<Record>> {
     let dir = dir.as_ref();
     let data_dir = dir
-        .join("binance/data/um/daily/klines")
+        .join("binance")
+        .join("data")
+        .join(market.as_path())
+        .join("daily/klines")
         .join(symbol.as_str())
         .join(timeframe.as_str());
     if !data_dir.exists() {
         return Err(ReaderError::Io(std::io::Error::new(
             std::io::ErrorKind::NotFound,
             format!(
-                "directory not found: {}/binance/data/um/daily/klines/{}/{}",
+                "directory not found: {}/binance/data/{}/daily/klines/{}/{}",
                 dir.display(),
+                market,
                 symbol,
                 timeframe,
             ),
@@ -378,7 +384,20 @@ mod tests {
 
     const HEADER12: &str = "open_time,open,high,low,close,volume,close_time,quote_volume,count,taker_buy_volume,taker_buy_quote_volume,ignore";
 
-    use crate::config::DataSource;
+    use crate::config::{DataSource, Market};
+
+    /// Existing tests exercise the default UM layout; market-specific tests
+    /// call the production function directly.
+    fn load_pipeline(
+        dir: impl AsRef<Path>,
+        symbol: &Symbol,
+        timeframe: &Timeframe,
+        start_date: Option<NaiveDate>,
+        end_date: Option<NaiveDate>,
+    ) -> Result<Vec<Record>> {
+        super::load_pipeline(dir, Market::Um, symbol, timeframe, start_date, end_date)
+    }
+
     fn sym(s: &str) -> Symbol {
         Symbol::parse(s).unwrap()
     }
@@ -399,7 +418,7 @@ mod tests {
 
     fn setup_dir(tmp: &Path, symbol: &str, tf: &str) -> std::path::PathBuf {
         let dir = tmp
-            .join("binance/data/um/daily/klines")
+            .join("binance/data/futures/um/daily/klines")
             .join(symbol)
             .join(tf);
         std::fs::create_dir_all(&dir).unwrap();
@@ -444,6 +463,25 @@ mod tests {
         let records = load_pipeline(tmp.path(), &sym("X"), &tf("1m"), None, None).unwrap();
         assert_eq!(records.len(), 1);
         assert!((records[0].close - 239.62).abs() < 0.001);
+    }
+
+    #[test]
+    fn reader_loads_each_binance_market() {
+        for market in [Market::Spot, Market::Um, Market::Cm] {
+            let tmp = TempDir::new().unwrap();
+            let dir = tmp
+                .path()
+                .join("binance/data")
+                .join(market.as_path())
+                .join("daily/klines/X/1m");
+            std::fs::create_dir_all(&dir).unwrap();
+            let csv = write_kline_csv([(100, 10.0, 11.0, 9.0, 10.5, 500.0)]);
+            create_test_zip(&dir, "X-1m-2024-01-01.zip", &csv);
+
+            let records =
+                super::load_pipeline(tmp.path(), market, &sym("X"), &tf("1m"), None, None).unwrap();
+            assert_eq!(records.len(), 1, "market {market}");
+        }
     }
 
     // — extract_date_from_filename —

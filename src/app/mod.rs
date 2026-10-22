@@ -123,6 +123,7 @@ pub fn load_columns(config: &DataConfig) -> Result<KlineColumns> {
     let records = match config.source_type() {
         DataSource::Binance => binance::load_pipeline(
             config.dir(),
+            config.market(),
             config.symbol(),
             config.timeframe(),
             config.start_date(),
