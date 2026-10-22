@@ -1,0 +1,23 @@
+# 配置说明: 全部字段以小写字母开头
+#
+# 目录约定 (重要): dir 是数据**根目录**, 程序按数据源自动追加子路径,
+#   {dir}/binance/data/{market}/{daily|monthly}/{dataset}/{symbol}[/{interval}]/*.zip
+#   market = "spot" | "futures/um" | "futures/cm", 默认 "futures/um"
+#   dataset = aggTrades | trades | bookTicker | bookDepth | fundingRate |
+#             liquidationSnapshot | metrics | indexPriceKlines | markPriceKlines |
+#             premiumIndexKlines
+#   因此不要把子路径写进 dir, 否则会找不到目录:
+#     错误: dir = "/data/nutilustrader/data/binance/data/futures/um/daily/metrics"
+#     正确: dir = "/data/nutilustrader/data"
+#
+# 单品种单数据集: 一个文件只描述一对 symbol/dataset, 多品种请写多个文件或调多次 load_columns.
+# 日期语义均为 UTC; end_date 含当日整天.
+dataset = "metrics" # 数据集, 必填; 也兼容 type = "metrics" (下载器字段名)
+market = "futures/um" # Binance 市场, 可选, 默认 futures/um; 可选: spot | futures/um | futures/cm (兼容 um/cm)
+dir = "/data/nutilustrader/data" # 数据根目录, 必填
+symbol = "BTCUSDT" # 品种, 必填, 单值
+# interval = "4h" # 仅 indexPriceKlines | markPriceKlines | premiumIndexKlines 必填
+#                  # 期货: 1m 3m 5m 15m 30m 1h 2h 4h 6h 8h 12h 1d 3d 1w 1mo
+#                  # spot: 另加 1s; 其它数据集禁止出现 interval
+# start_date = "2024-01-01" # 数据起始日期, 可选, 默认值: 无(全部数据), 格式: YYYY-MM-DD
+# end_date = "2024-12-31" # 数据结束日期(含当日), 可选, 默认值: 无(全部数据), 格式: YYYY-MM-DD
