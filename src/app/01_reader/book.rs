@@ -7,13 +7,15 @@
 //!
 //! `bookDepth` rows are periodic snapshots with one row per percentage level,
 //! keyed by `(timestamp, percentage)`. The timestamp is a UTC string.
+//! Archive levels are exactly `-5..=-1` and `1..=5`; `0` and out-of-range
+//! values are rejected.
 
 use std::path::PathBuf;
 
 use csv::StringRecord;
 
 use super::common::{self, DateWindow};
-use crate::error::Result;
+use crate::error::{ReaderError, Result};
 
 /// One best bid/ask snapshot.
 #[derive(Debug, Clone, PartialEq)]
@@ -80,9 +82,15 @@ fn parse_book_ticker_row(row: &StringRecord) -> Result<BookTickerRecord> {
 }
 
 fn parse_book_depth_row(row: &StringRecord) -> Result<BookDepthRecord> {
+    let percentage = common::parse_i32(row, 1, "percentage")?;
+    if !matches!(percentage, -5..=-1 | 1..=5) {
+        return Err(ReaderError::Parse(format!(
+            "percentage: {percentage} is not one of the archive levels -5..=-1 or 1..=5"
+        )));
+    }
     Ok(BookDepthRecord {
         time: common::parse_utc_datetime(row, 0, "timestamp")?,
-        percentage: common::parse_i32(row, 1, "percentage")?,
+        percentage,
         depth: common::parse_non_negative_f64(row, 2, "depth")?,
         notional: common::parse_non_negative_f64(row, 3, "notional")?,
     })
@@ -150,5 +158,21 @@ mod tests {
     #[test]
     fn book_depth_rejects_negative_depth() {
         assert!(parse_depth("2023-11-22 14:00:33,-5,-1.0,2.0").is_err());
+    }
+
+    #[test]
+    fn book_depth_rejects_zero_and_out_of_range_percentage() {
+        for invalid in ["0", "6", "-6", "100"] {
+            assert!(
+                parse_depth(&format!("2023-11-22 14:00:33,{invalid},1.0,2.0")).is_err(),
+                "accepted percentage {invalid}"
+            );
+        }
+        for valid in ["-5", "-1", "1", "5"] {
+            assert!(
+                parse_depth(&format!("2023-11-22 14:00:33,{valid},1.0,2.0")).is_ok(),
+                "rejected percentage {valid}"
+            );
+        }
     }
 }

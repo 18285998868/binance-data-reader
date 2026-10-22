@@ -1,3 +1,9 @@
+//! Configuration for one symbol × one dataset.
+//!
+//! TOML is first deserialized into an unvalidated intermediate form, then
+//! validated exactly once at the [`DataConfig`] boundary. The programmatic
+//! constructors apply the same rules.
+
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -105,6 +111,29 @@ impl DataConfig {
     ///
     /// `interval` is required by index/mark/premium klines and must be `None`
     /// for every other dataset.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReaderError::Config`] when the dataset/market pair is
+    /// unsupported, the symbol or interval is invalid, an interval is missing
+    /// or forbidden, or the date range is malformed or reversed.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use binance_reader::{DataConfig, Dataset};
+    ///
+    /// let cfg = DataConfig::new(
+    ///     Dataset::AggTrades,
+    ///     "/data",
+    ///     "BTCUSDT",
+    ///     None,
+    ///     Some("2024-01-01"),
+    ///     Some("2024-01-31"),
+    /// )?;
+    /// assert_eq!(cfg.dataset(), Dataset::AggTrades);
+    /// # Ok::<(), binance_reader::ReaderError>(())
+    /// ```
     pub fn new(
         dataset: Dataset,
         dir: impl AsRef<Path>,
@@ -125,6 +154,11 @@ impl DataConfig {
     }
 
     /// Same as [`Self::new`], with an explicit market.
+    ///
+    /// # Errors
+    ///
+    /// Same validation rules as [`Self::new`], including the dataset/market
+    /// support matrix check.
     pub fn new_with_market(
         dataset: Dataset,
         market: Market,
@@ -357,6 +391,14 @@ timeframe = "1m"
             Some("2024-01-01"),
         );
         assert!(cfg.is_err());
+    }
+
+    #[test]
+    fn constructor_rejects_symbol_path_traversal() {
+        let err = DataConfig::new(Dataset::Trades, "/data", "../../etc", None, None, None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("invalid symbol"), "unexpected: {err}");
     }
 
     #[test]

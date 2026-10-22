@@ -26,17 +26,26 @@ pub(crate) struct AggTradeRecord {
     pub(crate) is_buyer_maker: bool,
 }
 
-/// One individual trade.
+/// Quantity side carried by a trade row.
 ///
-/// `quote_qty` is present for spot/UM (`quote_qty` column); `base_qty` is
-/// present for CM (`base_qty` column). Exactly one is `Some`.
+/// Spot and USDⓈ-M archives publish `quote_qty` in column 3; COIN-M publishes
+/// `base_qty` instead. The enum makes the two cases mutually exclusive, so an
+/// invalid row cannot carry both or neither.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum TradeQty {
+    /// Quote-asset quantity (spot/USDⓈ-M).
+    Quote(f64),
+    /// Base-asset quantity (COIN-M).
+    Base(f64),
+}
+
+/// One individual trade.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct TradeRecord {
     pub(crate) trade_id: i64,
     pub(crate) price: f64,
     pub(crate) qty: f64,
-    pub(crate) quote_qty: Option<f64>,
-    pub(crate) base_qty: Option<f64>,
+    pub(crate) qty_side: TradeQty,
     pub(crate) time: i64,
     pub(crate) is_buyer_maker: bool,
 }
@@ -123,15 +132,11 @@ fn parse_trade_row(row: &StringRecord, market: Market) -> Result<TradeRecord> {
     let trade_id = common::parse_non_negative_i64(row, 0, "id")?;
     let price = common::parse_positive_f64(row, 1, "price")?;
     let qty = common::parse_positive_f64(row, 2, "qty")?;
-    let (quote_qty, base_qty) = match market {
-        Market::Cm => (
-            None,
-            Some(common::parse_non_negative_f64(row, 3, "base_qty")?),
-        ),
-        Market::Spot | Market::Um => (
-            Some(common::parse_non_negative_f64(row, 3, "quote_qty")?),
-            None,
-        ),
+    let qty_side = match market {
+        Market::Cm => TradeQty::Base(common::parse_non_negative_f64(row, 3, "base_qty")?),
+        Market::Spot | Market::Um => {
+            TradeQty::Quote(common::parse_non_negative_f64(row, 3, "quote_qty")?)
+        }
     };
     let time = common::parse_timestamp(row, 4, "time")?;
     let is_buyer_maker = common::parse_bool(row, 5, "is_buyer_maker")?;
@@ -139,8 +144,7 @@ fn parse_trade_row(row: &StringRecord, market: Market) -> Result<TradeRecord> {
         trade_id,
         price,
         qty,
-        quote_qty,
-        base_qty,
+        qty_side,
         time,
         is_buyer_maker,
     })
@@ -190,8 +194,7 @@ mod tests {
             Market::Spot,
         )
         .unwrap();
-        assert!((record.quote_qty.unwrap() - 6.8618).abs() < 1e-9);
-        assert!(record.base_qty.is_none());
+        assert!(matches!(record.qty_side, TradeQty::Quote(value) if (value - 6.8618).abs() < 1e-9));
     }
 
     #[test]
@@ -201,8 +204,9 @@ mod tests {
             Market::Cm,
         )
         .unwrap();
-        assert!((record.base_qty.unwrap() - 0.00709127).abs() < 1e-12);
-        assert!(record.quote_qty.is_none());
+        assert!(
+            matches!(record.qty_side, TradeQty::Base(value) if (value - 0.00709127).abs() < 1e-12)
+        );
     }
 
     #[test]

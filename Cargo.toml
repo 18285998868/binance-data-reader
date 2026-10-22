@@ -29,6 +29,8 @@ toml = "1.1"
 
 [lints.rust]
 warnings = "deny"
+missing_docs = "deny"
+unsafe_code = "deny"
 
 [lints.clippy]
 all = "deny"

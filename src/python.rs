@@ -32,14 +32,16 @@ fn extract_optional<'py, T>(config: &Bound<'py, PyDict>, key: &str) -> PyResult<
 where
     T: FromPyObject<'py>,
 {
-    config
-        .get_item(key)?
-        .map(|value| {
-            value
-                .extract()
-                .map_err(|_| PyTypeError::new_err(format!("config[{key}] has wrong type")))
-        })
-        .transpose()
+    let Some(value) = config.get_item(key)? else {
+        return Ok(None);
+    };
+    if value.is_none() {
+        return Ok(None);
+    }
+    value
+        .extract()
+        .map(Some)
+        .map_err(|_| PyTypeError::new_err(format!("config[{key}] has wrong type")))
 }
 
 fn extract_dataset(config: &Bound<'_, PyDict>) -> PyResult<Dataset> {
@@ -200,6 +202,28 @@ mod tests {
             config.set_item("symbol", "X").unwrap();
             let err = py_load_columns(&config).unwrap_err();
             assert!(err.to_string().contains("unsupported dataset"));
+        });
+    }
+
+    #[test]
+    fn optional_none_is_accepted() {
+        Python::initialize();
+        Python::attach(|py| {
+            let config = PyDict::new(py);
+            config.set_item("interval", py.None()).unwrap();
+            let interval = extract_optional::<String>(&config, "interval").unwrap();
+            assert!(interval.is_none());
+        });
+    }
+
+    #[test]
+    fn optional_wrong_type_is_rejected() {
+        Python::initialize();
+        Python::attach(|py| {
+            let config = PyDict::new(py);
+            config.set_item("interval", 1).unwrap();
+            let error = extract_optional::<String>(&config, "interval").unwrap_err();
+            assert!(error.to_string().contains("wrong type"));
         });
     }
 

@@ -4,7 +4,7 @@
 //! The layout mirrors the public archive exactly:
 //! `{dir}/binance/data/{market}/{daily|monthly}/{dataset}/{symbol}[/{interval}]/*.zip`.
 
-use std::io::Read;
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -17,8 +17,6 @@ use crate::types::{Dataset, Interval, Market, Symbol};
 
 /// Maximum number of skipped-row samples retained for warnings.
 const MAX_SKIP_SAMPLES: usize = 5;
-/// File-level hard-failure zero-tolerance threshold (backtest accuracy first).
-const MAX_FAILED_FILES_TOLERATED: usize = 0;
 /// Maximum number of failed-file samples retained for the error message.
 const MAX_FAILED_SAMPLES: usize = 5;
 /// Archive cadence.
@@ -117,15 +115,19 @@ fn should_skip_period(
     false
 }
 
-/// Row-level UTC date window: `[start 00:00, end 次日 00:00)`.
+/// Row-level UTC date window: `[start 00:00, end 23:59:59.999]`.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct DateWindow {
     start_ms: Option<i64>,
-    end_exclusive_ms: Option<i64>,
+    end_inclusive_ms: Option<i64>,
 }
 
 impl DateWindow {
     /// Build from inclusive calendar bounds; `end` covers its whole UTC day.
+    ///
+    /// The end is stored as the last millisecond of the day instead of
+    /// `end + 1 day`; this keeps `NaiveDate::MAX` representable and avoids
+    /// silently dropping the upper bound on overflow.
     pub(crate) fn new(start: Option<NaiveDate>, end: Option<NaiveDate>) -> Self {
         let midnight_ms = |date: NaiveDate| {
             date.and_hms_opt(0, 0, 0)
@@ -133,9 +135,15 @@ impl DateWindow {
                 .and_utc()
                 .timestamp_millis()
         };
+        let end_of_day_ms = |date: NaiveDate| {
+            date.and_hms_milli_opt(23, 59, 59, 999)
+                .expect("INVARIANT: NaiveDate always has a last millisecond")
+                .and_utc()
+                .timestamp_millis()
+        };
         Self {
             start_ms: start.map(midnight_ms),
-            end_exclusive_ms: end.and_then(|d| d.succ_opt()).map(midnight_ms),
+            end_inclusive_ms: end.map(end_of_day_ms),
         }
     }
 
@@ -145,8 +153,8 @@ impl DateWindow {
         {
             return false;
         }
-        if let Some(end) = self.end_exclusive_ms
-            && timestamp_ms >= end
+        if let Some(end) = self.end_inclusive_ms
+            && timestamp_ms > end
         {
             return false;
         }
@@ -155,7 +163,7 @@ impl DateWindow {
 
     /// Drop rows outside the window; a no-op when both bounds are absent.
     pub(crate) fn trim<T>(&self, rows: Vec<T>, time: impl Fn(&T) -> i64) -> Vec<T> {
-        if self.start_ms.is_none() && self.end_exclusive_ms.is_none() {
+        if self.start_ms.is_none() && self.end_inclusive_ms.is_none() {
             return rows;
         }
         rows.into_iter()
@@ -195,17 +203,25 @@ pub(crate) fn scan_zip_files(
         if let Some(interval) = interval {
             data_dir = data_dir.join(interval.as_str());
         }
-        if !data_dir.exists() {
-            continue;
-        }
+        let entries = match std::fs::read_dir(&data_dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                return Err(ReaderError::Io(std::io::Error::new(
+                    e.kind(),
+                    format!("read_dir {}: {e}", data_dir.display()),
+                )));
+            }
+        };
         found_dir = true;
-        let entries = std::fs::read_dir(&data_dir)?;
         for entry in entries {
             let entry = match entry {
                 Ok(entry) => entry,
                 Err(e) => {
-                    tracing::warn!(dir = %data_dir.display(), "read_dir entry failed: {e}");
-                    continue;
+                    return Err(ReaderError::Io(std::io::Error::new(
+                        e.kind(),
+                        format!("read_dir {} entry: {e}", data_dir.display()),
+                    )));
                 }
             };
             let path = entry.path();
@@ -251,7 +267,7 @@ pub(crate) fn scan_zip_files(
         )));
     }
 
-    paths.par_sort_unstable();
+    paths.sort_unstable();
     Ok(paths)
 }
 
@@ -269,10 +285,12 @@ pub(crate) struct SkippedRows {
 }
 
 impl SkippedRows {
-    fn push(&mut self, row_num: usize, detail: impl std::fmt::Display) {
+    /// Record one skipped row; the detail is only formatted when the sample
+    /// budget still has room, so high-error files do not pay snippet cost.
+    fn push(&mut self, row_num: usize, detail: impl FnOnce() -> String) {
         self.count += 1;
         if self.samples.len() < MAX_SKIP_SAMPLES {
-            self.samples.push(format!("row {row_num}: {detail}"));
+            self.samples.push(format!("row {row_num}: {}", detail()));
         }
     }
 
@@ -291,15 +309,13 @@ impl SkippedRows {
 /// Exact-match header detection against known header variants.
 ///
 /// A numeric first field never matches, so a headerless file is never
-/// mistaken for a headered one. Empty input is treated as header-only.
+/// mistaken for a headered one. Callers pass a non-empty first data line
+/// (leading blank lines are skipped before this check).
 fn has_csv_header(first_line: &[u8], headers: &[&[&str]]) -> bool {
-    if first_line.is_empty() {
-        return true;
-    }
     let Ok(line) = std::str::from_utf8(first_line) else {
         return false;
     };
-    let line = line.trim_end_matches('\r');
+    let line = line.trim_end_matches(['\r', '\n']);
     headers
         .iter()
         .any(|header| line.split(',').eq(header.iter().copied()))
@@ -315,35 +331,39 @@ fn row_snippet(row: &StringRecord, max_chars: usize) -> String {
     joined[..end].to_string()
 }
 
-/// Parse CSV bytes, skipping unparseable rows instead of failing the input.
+/// Parse CSV from a stream, skipping unparseable rows instead of failing the
+/// input. `headers` lists the accepted exact header lines; a matching first
+/// line is consumed. Leading blank lines are skipped with line numbers
+/// preserved in warnings. A single line without a trailing newline is parsed.
 ///
-/// `headers` lists the accepted exact header lines; a matching first line is
-/// consumed. Leading blank lines are skipped with their line numbers preserved
-/// in skip warnings. A single line without a trailing newline is parsed.
-pub(crate) fn parse_csv_bytes<T>(
-    bytes: &[u8],
+/// The stream is consumed incrementally and one `StringRecord` buffer is
+/// reused, so memory stays bounded by the output rows and CSV read buffers
+/// rather than the decompressed file size.
+pub(crate) fn parse_csv<T>(
+    reader: impl Read,
     headers: &[&[&str]],
     mut parse_row: impl FnMut(&StringRecord) -> Result<T>,
-) -> (Vec<T>, SkippedRows) {
-    let mut start = 0;
+) -> Result<(Vec<T>, SkippedRows)> {
+    let mut reader = BufReader::new(reader);
+    let mut first_line = Vec::new();
     let mut skipped_blank_lines = 0usize;
-    while start < bytes.len() && (bytes[start] == b'\n' || bytes[start] == b'\r') {
-        if bytes[start] == b'\n' {
-            skipped_blank_lines += 1;
+    loop {
+        first_line.clear();
+        if reader.read_until(b'\n', &mut first_line)? == 0 {
+            return Ok((Vec::new(), SkippedRows::default()));
         }
-        start += 1;
+        if first_line.iter().all(|byte| matches!(byte, b'\n' | b'\r')) {
+            if first_line.contains(&b'\n') {
+                skipped_blank_lines += 1;
+            }
+            continue;
+        }
+        break;
     }
-    if start >= bytes.len() {
-        return (Vec::new(), SkippedRows::default());
-    }
-    let rest = &bytes[start..];
 
-    let (first_line, data) = match rest.iter().position(|&b| b == b'\n') {
-        Some(position) => (&rest[..position], &rest[position + 1..]),
-        None => (rest, &rest[rest.len()..]),
-    };
-    let has_header = has_csv_header(first_line, headers);
-    let data = if has_header { data } else { rest };
+    let has_header = has_csv_header(&first_line, headers);
+    let prefix = if has_header { Vec::new() } else { first_line };
+    let data = std::io::Cursor::new(prefix).chain(reader);
 
     let mut reader = csv::ReaderBuilder::new()
         .has_headers(false)
@@ -353,44 +373,35 @@ pub(crate) fn parse_csv_bytes<T>(
     let mut records = Vec::new();
     let mut skipped = SkippedRows::default();
     let mut row_num = skipped_blank_lines + usize::from(has_header);
+    let mut row = StringRecord::new();
 
-    for result in reader.records() {
-        row_num += 1;
-        let row = match result {
-            Ok(row) => row,
+    loop {
+        match reader.read_record(&mut row) {
+            Ok(true) => {}
+            Ok(false) => break,
             Err(e) => {
-                skipped.push(row_num, format!("{e}"));
+                row_num += 1;
+                skipped.push(row_num, || e.to_string());
                 continue;
             }
-        };
+        }
+        row_num += 1;
         match parse_row(&row) {
             Ok(record) => records.push(record),
             Err(e) => {
-                let snippet = row_snippet(&row, 64);
-                skipped.push(row_num, format!("[{snippet}] {e}"));
+                skipped.push(row_num, || {
+                    let snippet = row_snippet(&row, 64);
+                    format!("[{snippet}] {e}")
+                });
             }
         }
     }
-    (records, skipped)
+    Ok((records, skipped))
 }
 
-/// Read the first CSV entry (case-insensitive extension) from a zip.
-fn read_zip_csv(path: &Path) -> Result<Vec<u8>> {
-    let file = std::fs::File::open(path)?;
-    let mut archive = zip::ZipArchive::new(file)?;
-    for index in 0..archive.len() {
-        let mut entry = archive.by_index(index)?;
-        if !entry.name().to_ascii_lowercase().ends_with(".csv") {
-            continue;
-        }
-        let mut buf = Vec::new();
-        entry.read_to_end(&mut buf)?;
-        return Ok(buf);
-    }
-    Err(ReaderError::Parse(format!(
-        "no CSV file found in zip: {}",
-        path.display()
-    )))
+fn is_csv_entry(name: &str) -> bool {
+    name.rsplit_once('.')
+        .is_some_and(|(_, extension)| extension.eq_ignore_ascii_case("csv"))
 }
 
 fn load_single_zip<T>(
@@ -398,8 +409,21 @@ fn load_single_zip<T>(
     headers: &[&[&str]],
     parse_row: impl FnMut(&StringRecord) -> Result<T>,
 ) -> Result<(Vec<T>, usize)> {
-    let bytes = read_zip_csv(path)?;
-    let (records, skipped) = parse_csv_bytes(&bytes, headers, parse_row);
+    let file = std::fs::File::open(path)?;
+    let mut archive = zip::ZipArchive::new(file)?;
+    let mut csv_index = None;
+    for index in 0..archive.len() {
+        let name = archive.by_index(index)?.name().to_owned();
+        if is_csv_entry(&name) {
+            csv_index = Some(index);
+            break;
+        }
+    }
+    let csv_index = csv_index.ok_or_else(|| {
+        ReaderError::Parse(format!("no CSV file found in zip: {}", path.display()))
+    })?;
+    let entry = archive.by_index(csv_index)?;
+    let (records, skipped) = parse_csv(entry, headers, parse_row)?;
     skipped.warn(path);
     Ok((records, skipped.count))
 }
@@ -426,18 +450,22 @@ pub(crate) fn load_all<T: Send>(
         })
         .collect();
 
-    let mut all = Vec::new();
+    let total_rows: usize = outcomes
+        .iter()
+        .filter_map(|(_, outcome)| outcome.as_ref().ok().map(|(rows, _)| rows.len()))
+        .sum();
+    let mut all = Vec::with_capacity(total_rows);
     let mut failed = Vec::new();
     let mut files_with_skips = 0usize;
     let mut skipped_rows_total = 0usize;
     for (path, outcome) in outcomes {
         match outcome {
-            Ok((records, skipped)) => {
+            Ok((mut records, skipped)) => {
                 if skipped > 0 {
                     files_with_skips += 1;
                     skipped_rows_total += skipped;
                 }
-                all.extend(records);
+                all.append(&mut records);
             }
             Err(detail) => failed.push(format!("{}: {detail}", path.display())),
         }
@@ -454,7 +482,7 @@ pub(crate) fn load_all<T: Send>(
     Ok(all)
 }
 
-/// Hard-failure collection: over the (zero) tolerance, fail with samples.
+/// Hard-failure collection: any failed file fails the batch.
 pub(crate) fn fail_on_hard_errors(source: &str, failed: &[String]) -> Result<()> {
     if failed.is_empty() {
         return Ok(());
@@ -464,20 +492,11 @@ pub(crate) fn fail_on_hard_errors(source: &str, failed: &[String]) -> Result<()>
         .take(MAX_FAILED_SAMPLES)
         .map(String::as_str)
         .collect();
-    if failed.len() > MAX_FAILED_FILES_TOLERATED {
-        return Err(ReaderError::Parse(format!(
-            "{source}: {} file(s) failed to load (tolerated {MAX_FAILED_FILES_TOLERATED}): {}",
-            failed.len(),
-            samples.join("; ")
-        )));
-    }
-    tracing::warn!(
-        source,
-        failed_files = failed.len(),
-        samples = ?samples,
-        "loaded with failed files within tolerance; review data completeness"
-    );
-    Ok(())
+    Err(ReaderError::Parse(format!(
+        "{source}: {} file(s) failed to load: {}",
+        failed.len(),
+        samples.join("; ")
+    )))
 }
 
 // — field parsers —
@@ -711,6 +730,41 @@ mod tests {
     }
 
     #[test]
+    fn date_window_handles_max_date() {
+        let max = NaiveDate::MAX;
+        let window = DateWindow::new(Some(max), Some(max));
+        let last_ms = max
+            .and_hms_milli_opt(23, 59, 59, 999)
+            .unwrap()
+            .and_utc()
+            .timestamp_millis();
+        assert!(window.contains(last_ms));
+        assert!(!window.contains(last_ms + 1));
+    }
+
+    #[test]
+    fn hard_errors_are_zero_tolerance() {
+        assert!(fail_on_hard_errors("test", &[]).is_ok());
+        let failed = vec!["a.zip: corrupt".to_string()];
+        let error = fail_on_hard_errors("test", &failed)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("1 file(s) failed to load"), "{error}");
+        assert!(error.contains("a.zip: corrupt"), "{error}");
+    }
+
+    #[test]
+    fn leading_blank_lines_are_skipped() {
+        let csv = "\n\r\n1,10.0\n2,11.0\n";
+        let (rows, skipped) = parse_csv::<i64>(csv.as_bytes(), &[], |row| {
+            parse_non_negative_i64(row, 0, "id")
+        })
+        .unwrap();
+        assert_eq!(rows, vec![1, 2]);
+        assert_eq!(skipped.count, 0);
+    }
+
+    #[test]
     fn date_window_trim_keeps_order() {
         let window = DateWindow::new(Some(pd("2024-01-10")), Some(pd("2024-01-10")));
         let ms = |d: &str| {
@@ -734,13 +788,83 @@ mod tests {
         assert!(!has_csv_header(b"time,price,extra", &headers));
     }
 
+    fn record(fields: &[&str]) -> StringRecord {
+        let mut record = StringRecord::new();
+        for field in fields {
+            record.push_field(field);
+        }
+        record
+    }
+
+    #[test]
+    fn parser_helpers_cover_valid_and_invalid_values() {
+        assert!(parse_bool(&record(&["TRUE"]), 0, "flag").unwrap());
+        assert!(!parse_bool(&record(&["false"]), 0, "flag").unwrap());
+        assert!(parse_bool(&record(&["yes"]), 0, "flag").is_err());
+
+        assert_eq!(parse_string(&record(&[" BUY "]), 0, "side").unwrap(), "BUY");
+        assert!(parse_string(&record(&["  "]), 0, "side").is_err());
+
+        assert_eq!(
+            parse_utc_datetime(&record(&["2024-01-01 00:00:00"]), 0, "time").unwrap(),
+            1_704_067_200_000
+        );
+        assert!(parse_utc_datetime(&record(&["2024-01-01T00:00:00"]), 0, "time").is_err());
+
+        assert_eq!(
+            parse_optional_non_negative_f64(&record(&[""]), 0, "ratio").unwrap(),
+            None
+        );
+        assert_eq!(
+            parse_optional_non_negative_f64(&record(&["0"]), 0, "ratio").unwrap(),
+            Some(0.0)
+        );
+        for invalid in ["-0.1", "NaN", "inf"] {
+            assert!(
+                parse_optional_non_negative_f64(&record(&[invalid]), 0, "ratio").is_err(),
+                "accepted {invalid:?}"
+            );
+        }
+
+        assert!(parse_non_negative_i64(&record(&["-1"]), 0, "id").is_err());
+        assert!(parse_positive_f64(&record(&["0"]), 0, "price").is_err());
+        assert!(parse_positive_f64(&record(&["NaN"]), 0, "price").is_err());
+    }
+
+    #[test]
+    fn parse_csv_handles_crlf_header_and_empty_input() {
+        let header: [&str; 2] = ["time", "price"];
+        let headers: [&[&str]; 1] = [&header];
+        let (rows, skipped) =
+            parse_csv::<i64>(b"time,price\r\n1,10.0\r\n".as_slice(), &headers, |row| {
+                parse_non_negative_i64(row, 0, "id")
+            })
+            .unwrap();
+        assert_eq!(rows, vec![1]);
+        assert_eq!(skipped.count, 0);
+
+        let (rows, skipped) = parse_csv::<i64>(b"".as_slice(), &headers, |_| Ok(1)).unwrap();
+        assert!(rows.is_empty());
+        assert_eq!(skipped.count, 0);
+    }
+
+    #[test]
+    fn csv_entry_extension_is_case_insensitive() {
+        assert!(is_csv_entry("data.csv"));
+        assert!(is_csv_entry("data.CSV"));
+        assert!(!is_csv_entry("data.csv.bak"));
+        assert!(!is_csv_entry("data.txt"));
+        assert!(!is_csv_entry("data"));
+    }
+
     #[test]
     fn parse_skips_bad_rows_and_keeps_good_ones() {
         let csv = ["1,10.0", "2,abc", "3,-1.0", "4,11.0"].join("\n");
-        let (rows, skipped) = parse_csv_bytes::<i64>(csv.as_bytes(), &[], |row| {
+        let (rows, skipped) = parse_csv::<i64>(csv.as_bytes(), &[], |row| {
             let _ = parse_positive_f64(row, 1, "price")?;
             parse_non_negative_i64(row, 0, "id")
-        });
+        })
+        .unwrap();
         assert_eq!(rows, vec![1, 4]);
         assert_eq!(skipped.count, 2);
     }
@@ -749,15 +873,18 @@ mod tests {
     fn parse_header_only_is_empty() {
         let header: [&str; 2] = ["time", "price"];
         let headers: [&[&str]; 1] = [&header];
-        let (rows, skipped) = parse_csv_bytes::<i64>(b"time,price", &headers, |_| Ok(1));
+        let (rows, skipped) =
+            parse_csv::<i64>(b"time,price".as_slice(), &headers, |_| Ok(1)).unwrap();
         assert!(rows.is_empty());
         assert_eq!(skipped.count, 0);
     }
 
     #[test]
     fn parse_single_line_without_newline() {
-        let (rows, skipped) =
-            parse_csv_bytes::<i64>(b"1,10.0", &[], |row| parse_non_negative_i64(row, 0, "id"));
+        let (rows, skipped) = parse_csv::<i64>(b"1,10.0".as_slice(), &[], |row| {
+            parse_non_negative_i64(row, 0, "id")
+        })
+        .unwrap();
         assert_eq!(rows, vec![1]);
         assert_eq!(skipped.count, 0);
     }

@@ -5,7 +5,7 @@ use crate::app::funding::FundingRateRecord;
 use crate::app::klines::KlineRecord;
 use crate::app::liquidation::LiquidationRecord;
 use crate::app::metrics::MetricsRecord;
-use crate::app::trades::{AggTradeRecord, TradeRecord};
+use crate::app::trades::{AggTradeRecord, TradeQty, TradeRecord};
 use crate::types::Dataset;
 
 /// OHLCV columns for index/mark/premium klines.
@@ -466,38 +466,37 @@ impl From<Vec<AggTradeRecord>> for AggTradeColumns {
 impl From<Vec<TradeRecord>> for TradeColumns {
     fn from(records: Vec<TradeRecord>) -> Self {
         let n = records.len();
-        let has_quote = records.iter().any(|r| r.quote_qty.is_some());
-        let has_base = records.iter().any(|r| r.base_qty.is_some());
+        let quote_side = records
+            .first()
+            .is_some_and(|row| matches!(row.qty_side, TradeQty::Quote(_)));
         let mut columns = Self {
             time: Vec::with_capacity(n),
             trade_id: Vec::with_capacity(n),
             price: Vec::with_capacity(n),
             qty: Vec::with_capacity(n),
-            quote_qty: has_quote.then(|| Vec::with_capacity(n)),
-            base_qty: has_base.then(|| Vec::with_capacity(n)),
+            quote_qty: None,
+            base_qty: None,
             is_buyer_maker: Vec::with_capacity(n),
         };
+        let mut quote_qty = Vec::with_capacity(if quote_side { n } else { 0 });
+        let mut base_qty = Vec::with_capacity(if quote_side { 0 } else { n });
         for record in records {
             columns.time.push(record.time);
             columns.trade_id.push(record.trade_id);
             columns.price.push(record.price);
             columns.qty.push(record.qty);
-            if let Some(values) = &mut columns.quote_qty {
-                values.push(
-                    record
-                        .quote_qty
-                        .expect("INVARIANT: spot/UM trade rows always carry quote_qty"),
-                );
-            }
-            if let Some(values) = &mut columns.base_qty {
-                values.push(
-                    record
-                        .base_qty
-                        .expect("INVARIANT: CM trade rows always carry base_qty"),
-                );
+            match record.qty_side {
+                TradeQty::Quote(value) => quote_qty.push(value),
+                TradeQty::Base(value) => base_qty.push(value),
             }
             columns.is_buyer_maker.push(record.is_buyer_maker);
         }
+        debug_assert!(
+            quote_qty.is_empty() || base_qty.is_empty(),
+            "trade rows must share a single quantity side"
+        );
+        columns.quote_qty = (!quote_qty.is_empty()).then_some(quote_qty);
+        columns.base_qty = (!base_qty.is_empty()).then_some(base_qty);
         columns
     }
 }
@@ -789,8 +788,7 @@ mod tests {
             trade_id: 1,
             price: 10.0,
             qty: 2.0,
-            quote_qty: Some(20.0),
-            base_qty: None,
+            qty_side: TradeQty::Quote(20.0),
             time: 100,
             is_buyer_maker: false,
         };
@@ -798,6 +796,19 @@ mod tests {
         assert_eq!(columns.len(), 1);
         assert_eq!(columns.quote_qty().unwrap(), &[20.0]);
         assert!(columns.base_qty().is_none());
+
+        let base = TradeRecord {
+            trade_id: 2,
+            price: 10.0,
+            qty: 2.0,
+            qty_side: TradeQty::Base(0.2),
+            time: 101,
+            is_buyer_maker: true,
+        };
+        let columns: TradeColumns = vec![base].into();
+        assert_eq!(columns.len(), 1);
+        assert!(columns.quote_qty().is_none());
+        assert_eq!(columns.base_qty().unwrap(), &[0.2]);
     }
 
     #[test]

@@ -1,3 +1,5 @@
+//! Domain enums and newtypes: market, dataset family, interval and symbol.
+
 use std::fmt;
 use std::str::FromStr;
 
@@ -168,7 +170,10 @@ impl Dataset {
     #[must_use]
     pub fn storage_symbol(self, symbol: &Symbol) -> &str {
         if matches!(self, Self::IndexPriceKlines) {
-            symbol.as_str().split('_').next().unwrap_or(symbol.as_str())
+            symbol
+                .as_str()
+                .split_once('_')
+                .map_or(symbol.as_str(), |(underlying, _)| underlying)
         } else {
             symbol.as_str()
         }
@@ -224,6 +229,11 @@ pub struct Interval(String);
 
 impl Interval {
     /// Parse and validate an interval for `market`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReaderError::Config`] when the trimmed value is not in the
+    /// market's interval allowlist.
     pub fn parse(market: Market, s: impl AsRef<str>) -> Result<Self, ReaderError> {
         let s = s.as_ref().trim();
         let valid = match market {
@@ -257,19 +267,35 @@ impl AsRef<str> for Interval {
     }
 }
 
-/// Validated symbol: non-empty after trimming.
+/// Validated Binance symbol.
 ///
-/// Keeping this a newtype means downstream functions never re-check emptiness
-/// (`parse-don't-validate`).
+/// Symbols are ASCII letters, digits and `_` (e.g. `BTCUSDT`, `BTCUSD_PERP`,
+/// `BTCUSDT_250926`). The first character must be alphanumeric so the value is
+/// always safe as a single path component and [`Dataset::storage_symbol`]
+/// never yields an empty prefix. Keeping this a newtype means downstream
+/// functions never re-check the character set (`parse-don't-validate`).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Symbol(String);
 
 impl Symbol {
     /// Parse and validate a symbol.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReaderError::Config`] when the trimmed value is empty, has a
+    /// non-alphanumeric first character, or contains anything other than
+    /// ASCII letters, digits and `_`.
     pub fn parse(s: impl AsRef<str>) -> Result<Self, ReaderError> {
         let trimmed = s.as_ref().trim();
         if trimmed.is_empty() {
             return Err(ReaderError::Config("symbol must not be empty".into()));
+        }
+        let mut chars = trimmed.chars();
+        let first_is_alphanumeric = chars.next().is_some_and(|c| c.is_ascii_alphanumeric());
+        if !first_is_alphanumeric || !chars.all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return Err(ReaderError::Config(format!(
+                "invalid symbol {trimmed:?}: use ASCII letters, digits and '_', starting with a letter or digit"
+            )));
         }
         Ok(Self(trimmed.to_owned()))
     }
@@ -342,5 +368,36 @@ mod tests {
         assert!(Symbol::parse("").is_err());
         assert!(Symbol::parse("   ").is_err());
         assert_eq!(Symbol::parse(" BTCUSDT ").unwrap().as_str(), "BTCUSDT");
+    }
+
+    #[test]
+    fn symbol_rejects_path_and_unsafe_characters() {
+        for invalid in [
+            "..",
+            "../BTCUSDT",
+            "BTC/USDT",
+            "BTC\\USDT",
+            "BTC USDT",
+            "BTC.USDT",
+            "_BTCUSDT",
+            "-BTCUSDT",
+            "BTCUSDT-",
+            "Ω",
+        ] {
+            assert!(Symbol::parse(invalid).is_err(), "accepted {invalid:?}");
+        }
+    }
+
+    #[test]
+    fn symbol_accepts_archive_shapes() {
+        for valid in [
+            "BTCUSDT",
+            "1000BONKUSDT",
+            "BTCUSD_PERP",
+            "BTCUSDT_250926",
+            "btcusdt",
+        ] {
+            assert_eq!(Symbol::parse(valid).unwrap().as_str(), valid);
+        }
     }
 }

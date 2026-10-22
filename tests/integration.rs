@@ -1,3 +1,5 @@
+//! End-to-end archive loading tests using synthetic ZIP files.
+
 use std::path::{Path, PathBuf};
 
 use tempfile::TempDir;
@@ -6,7 +8,7 @@ use binance_reader::{DataConfig, Dataset, Market, ReaderError, load_columns};
 
 mod common;
 
-use common::create_test_zip;
+use common::{create_test_zip, create_test_zip_entry};
 
 const KLINE_HEADER: &str = "open_time,open,high,low,close,volume,close_time,quote_volume,count,taker_buy_volume,taker_buy_quote_volume,ignore";
 
@@ -134,6 +136,34 @@ fn metrics_string_time_optional_ratios_and_date_filter() {
 }
 
 #[test]
+fn metrics_symbol_mismatch_rows_are_skipped() {
+    let tmp = TempDir::new().unwrap();
+    let root = data_root(&tmp);
+    let dir = archive_dir(&root, "futures/um", "daily", "metrics", "X", None);
+    create_test_zip(
+        &dir,
+        "X-metrics-2024-01-01.zip",
+        "create_time,symbol,sum_open_interest,sum_open_interest_value,count_toptrader_long_short_ratio,sum_toptrader_long_short_ratio,count_long_short_ratio,sum_taker_long_short_vol_ratio\n\
+         2024-01-01 00:00:00,X,1,2,3,4,5,6\n\
+         2024-01-01 00:05:00,Y,1,2,3,4,5,6\n",
+    );
+
+    let cfg = DataConfig::new(
+        Dataset::Metrics,
+        &root,
+        "X",
+        None,
+        Some("2024-01-01"),
+        Some("2024-01-01"),
+    )
+    .unwrap();
+    let columns = load_columns(&cfg).unwrap();
+    let metrics = columns.as_metrics().unwrap();
+    assert_eq!(metrics.len(), 1);
+    assert_eq!(metrics.time(), &[ms("2024-01-01", 0, 0)]);
+}
+
+#[test]
 fn funding_rate_monthly_path_and_signed_rate() {
     let tmp = TempDir::new().unwrap();
     let root = data_root(&tmp);
@@ -244,6 +274,64 @@ fn spot_agg_trades_are_headerless_with_extra_column() {
     assert_eq!(agg.len(), 2);
     assert_eq!(agg.agg_trade_id(), &[515_330_094, 515_330_095]);
     assert_eq!(agg.is_buyer_maker(), &[false, false]);
+}
+
+#[test]
+fn spot_trades_are_headerless_with_quote_qty() {
+    let tmp = TempDir::new().unwrap();
+    let root = data_root(&tmp);
+    let dir = archive_dir(&root, "spot", "daily", "trades", "BNBUSDT", None);
+    create_test_zip(
+        &dir,
+        "BNBUSDT-trades-2024-01-01.zip",
+        "697594291,311.9,0.022,6.8618,1704067200107,False,True\n",
+    );
+
+    let cfg = DataConfig::new_with_market(
+        Dataset::Trades,
+        Market::Spot,
+        &root,
+        "BNBUSDT",
+        None,
+        None,
+        None,
+    )
+    .unwrap();
+    let columns = load_columns(&cfg).unwrap();
+    let trades = columns.as_trades().unwrap();
+    assert_eq!(trades.quote_qty().unwrap(), &[6.8618]);
+    assert!(trades.base_qty().is_none());
+}
+
+#[test]
+fn um_agg_trades_use_headered_layout() {
+    let tmp = TempDir::new().unwrap();
+    let root = data_root(&tmp);
+    let dir = archive_dir(&root, "futures/um", "daily", "aggTrades", "X", None);
+    create_test_zip(
+        &dir,
+        "X-aggTrades-2024-01-01.zip",
+        "agg_trade_id,price,quantity,first_trade_id,last_trade_id,transact_time,is_buyer_maker\n\
+         1,0.00478,10460.0,1,1,1704067200000,false\n",
+    );
+
+    let cfg = DataConfig::new(Dataset::AggTrades, &root, "X", None, None, None).unwrap();
+    let columns = load_columns(&cfg).unwrap();
+    let agg = columns.as_agg_trades().unwrap();
+    assert_eq!(agg.agg_trade_id(), &[1]);
+    assert_eq!(agg.quantity(), &[10460.0]);
+}
+
+#[test]
+fn zip_without_csv_fails_batch() {
+    let tmp = TempDir::new().unwrap();
+    let root = data_root(&tmp);
+    let dir = archive_dir(&root, "futures/um", "daily", "metrics", "X", None);
+    create_test_zip_entry(&dir, "X-metrics-2024-01-01.zip", "readme.txt", "not a csv");
+
+    let cfg = DataConfig::new(Dataset::Metrics, &root, "X", None, None, None).unwrap();
+    let error = load_columns(&cfg).unwrap_err().to_string();
+    assert!(error.contains("no CSV file found"), "unexpected: {error}");
 }
 
 #[test]

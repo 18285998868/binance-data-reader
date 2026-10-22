@@ -7,7 +7,7 @@
 //!
 //! See the crate README for layout and configuration details.
 
-pub mod app;
+mod app;
 mod config;
 mod error;
 mod python;

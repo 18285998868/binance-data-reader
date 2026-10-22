@@ -6,7 +6,7 @@ mod book;
 #[path = "02_clean.rs"]
 mod clean;
 #[path = "03_column.rs"]
-pub mod columns;
+mod columns;
 #[path = "01_reader/common.rs"]
 mod common;
 #[path = "01_reader/funding.rs"]
@@ -34,6 +34,31 @@ pub use columns::{
 /// The output rows are sorted by the dataset's primary key and deduplicated
 /// (keep-first). Row-level bad data is warned and skipped; file-level damage
 /// (corrupt zip, missing CSV, invalid filename date) fails the batch.
+///
+/// # Errors
+///
+/// Returns [`crate::ReaderError::Io`] when the dataset directory is missing or
+/// a directory/file cannot be read, and [`crate::ReaderError::Parse`] for
+/// invalid archive filenames or any file-level parse failure. ZIP errors are
+/// folded into the per-file [`crate::ReaderError::Parse`] aggregate.
+///
+/// # Examples
+///
+/// ```no_run
+/// use binance_reader::{DataConfig, Dataset, load_columns};
+///
+/// let cfg = DataConfig::new(
+///     Dataset::Metrics,
+///     "/data",
+///     "BTCUSDT",
+///     None,
+///     Some("2024-01-01"),
+///     Some("2024-01-31"),
+/// )?;
+/// let columns = load_columns(&cfg)?;
+/// println!("{} rows", columns.len());
+/// # Ok::<(), binance_reader::ReaderError>(())
+/// ```
 #[tracing::instrument(skip_all, fields(
     dataset = %config.dataset(),
     market = %config.market(),
@@ -108,7 +133,7 @@ pub fn load_columns(config: &DataConfig) -> Result<DatasetColumns> {
             DatasetColumns::FundingRate(rows.into())
         }
         Dataset::Metrics => {
-            let mut rows = metrics::load(&files, &window)?;
+            let mut rows = metrics::load(&files, &window, config.symbol())?;
             warn_dedup(
                 config,
                 clean::sort_dedup_by_key(&mut rows, |row| row.create_time),
