@@ -224,7 +224,7 @@ fn load_single_zip(path: &Path) -> Result<(Vec<Record>, usize)> {
     let mut csv_bytes: Option<Vec<u8>> = None;
     for i in 0..archive.len() {
         let mut entry = archive.by_index(i)?;
-        let name = entry.name().to_ascii_lowercase();
+        let name = entry.name()?.to_ascii_lowercase();
         if !name.ends_with(".csv") {
             continue;
         }

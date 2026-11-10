@@ -18,7 +18,7 @@ fn py_err(e: ReaderError) -> PyErr {
 
 fn extract_required<'py, T>(cfg: &Bound<'py, PyDict>, key: &str) -> PyResult<T>
 where
-    T: FromPyObject<'py>,
+    T: for<'a> FromPyObject<'a, 'py>,
 {
     cfg.get_item(key)?
         .ok_or_else(|| PyKeyError::new_err(format!("missing required config key: {key}")))?
@@ -28,7 +28,7 @@ where
 
 fn extract_optional<'py, T>(cfg: &Bound<'py, PyDict>, key: &str) -> PyResult<Option<T>>
 where
-    T: FromPyObject<'py>,
+    T: for<'a> FromPyObject<'a, 'py>,
 {
     cfg.get_item(key)?
         .map(|v| {
