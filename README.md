@@ -19,7 +19,7 @@
 ```toml
 type = "binance" # 必填
 market = "futures/um" # 可选，默认 futures/um；可选 spot | futures/um | futures/cm
-dir = "/data/nutilustrader/data" # 必填，数据根目录(程序按数据源自动追加子路径)
+dir = "path/to/data" # 必填，数据根目录(程序按数据源自动追加子路径)
 symbol = "BTCUSDT" # 必填，单品种
 timeframe = "1d" # 必填，单周期；binance "1m"~"1d"，dukascopy "M1"/"H1"/"D1"
 # start_date = "2024-01-01" # 可选
@@ -166,7 +166,7 @@ tests/
 ```toml
 type = "binance" # 必填，可选 "binance" | "dukascopy"
 market = "futures/um" # 可选，默认 futures/um；可选 spot | futures/um | futures/cm
-dir = "/data/nutilustrader/data" # 必填，数据根目录(程序按数据源自动追加子路径)
+dir = "path/to/data" # 必填，数据根目录(程序按数据源自动追加子路径)
 symbol = "BTCUSDT" # 必填，单品种
 timeframe = "1d" # 必填，单周期；binance "1m"~"1d"，dukascopy "M1"/"H1"/"D1"
 # start_date = "2024-01-01" # 可选，缺省无(全部数据)，格式 YYYY-MM-DD
@@ -220,7 +220,7 @@ uvx maturin build # 产物 target/wheels/*cp39-abi3*.whl，>=3.9 通用
 ```python
 import kline_reader
 cols = kline_reader.load_columns({ # dict 同 DataConfig 字段，非法直接报错
-    "type": "binance", "market": "futures/um", "dir": "/data/nutilustrader/data",
+    "type": "binance", "market": "futures/um", "dir": "path/to/data",
     "symbol": "BTCUSDT", "timeframe": "1d",
     "start_date": "2024-01-01", "end_date": "2024-01-03",
 })
