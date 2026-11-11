@@ -43,7 +43,7 @@
 ```toml
 dataset = "metrics" # 必填；也可写 type = "metrics"（兼容下载器字段名）
 market = "futures/um" # 可选，默认 futures/um；spot | futures/um | futures/cm
-dir = "/data/nutilustrader/data" # 必填，数据根目录（程序自动追加 binance/data/...）
+dir = "path/to/data" # 必填，数据根目录（程序自动追加 binance/data/...）
 symbol = "BTCUSDT" # 必填，单品种
 # interval = "4h" # 仅 index/mark/premium klines 必填
 # start_date = "2024-01-01" # 可选，含当日（UTC）
@@ -208,7 +208,7 @@ tests/
 ```toml
 dataset = "aggTrades" # 必填；可选 10 种之一，也接受 type = "..."
 market = "futures/um" # 可选，默认 futures/um；spot | futures/um | futures/cm
-dir = "/data/nutilustrader/data" # 必填，数据根目录
+dir = "path/to/data" # 必填，数据根目录
 symbol = "BTCUSDT" # 必填，单品种
 # interval = "1m" # 仅 index/mark/premium klines 必填；其它数据集禁止出现
 # start_date = "2024-01-01" # 可选，UTC，含当日
@@ -245,7 +245,7 @@ import binance_reader
 cols = binance_reader.load_columns({
     "dataset": "metrics",          # 或 "type": "metrics"
     "market": "futures/um",
-    "dir": "/data/nutilustrader/data",
+    "dir": "path/to/data",
     "symbol": "BTCUSDT",
     "start_date": "2024-01-01",
     "end_date": "2024-01-03",
