@@ -11,7 +11,7 @@ use chrono::NaiveDate;
 use serde::Deserialize;
 
 use crate::error::ReaderError;
-use crate::types::{Dataset, Interval, Market, Symbol};
+use crate::types::{Dataset, Interval, Market, Symbol, Timeframe};
 
 /// TOML intermediate representation: strings only, no validation.
 ///
@@ -121,7 +121,7 @@ impl DataConfig {
     /// # Examples
     ///
     /// ```
-    /// use binance_reader::{DataConfig, Dataset};
+    /// use binance_data_reader::{DataConfig, Dataset};
     ///
     /// let cfg = DataConfig::new(
     ///     Dataset::AggTrades,
@@ -132,7 +132,7 @@ impl DataConfig {
     ///     Some("2024-01-31"),
     /// )?;
     /// assert_eq!(cfg.dataset(), Dataset::AggTrades);
-    /// # Ok::<(), binance_reader::ReaderError>(())
+    /// # Ok::<(), binance_data_reader::ReaderError>(())
     /// ```
     pub fn new(
         dataset: Dataset,
@@ -250,6 +250,157 @@ impl fmt::Display for DataConfig {
             self.symbol,
             self.interval.as_ref().map_or("*", Interval::as_str)
         )
+    }
+}
+
+/// TOML intermediate form for [`KlineConfig`].
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawKlineConfig {
+    /// Optional Binance market; defaults to `futures/um`.
+    #[serde(default)]
+    market: Option<Market>,
+    dir: PathBuf,
+    symbol: String,
+    timeframe: String,
+    start_date: Option<String>,
+    end_date: Option<String>,
+}
+
+/// One symbol × one timeframe kline load configuration (Binance archives).
+///
+/// Construction validates the market, symbol, timeframe and date range.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(try_from = "RawKlineConfig")]
+pub struct KlineConfig {
+    market: Market,
+    dir: PathBuf,
+    symbol: Symbol,
+    timeframe: Timeframe,
+    start_date: Option<NaiveDate>,
+    end_date: Option<NaiveDate>,
+}
+
+impl KlineConfig {
+    /// Programmatic constructor using the default `futures/um` market.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReaderError::Config`] for an invalid symbol/timeframe or a
+    /// malformed/reversed date range.
+    pub fn new(
+        dir: impl AsRef<Path>,
+        symbol: &str,
+        timeframe: &str,
+        start_date: Option<&str>,
+        end_date: Option<&str>,
+    ) -> Result<Self, ReaderError> {
+        Self::build(Market::Um, dir, symbol, timeframe, start_date, end_date)
+    }
+
+    /// Same as [`Self::new`] with an explicit market.
+    ///
+    /// # Errors
+    ///
+    /// Same validation rules as [`Self::new`].
+    pub fn new_with_market(
+        market: Market,
+        dir: impl AsRef<Path>,
+        symbol: &str,
+        timeframe: &str,
+        start_date: Option<&str>,
+        end_date: Option<&str>,
+    ) -> Result<Self, ReaderError> {
+        Self::build(market, dir, symbol, timeframe, start_date, end_date)
+    }
+
+    fn build(
+        market: Market,
+        dir: impl AsRef<Path>,
+        symbol: &str,
+        timeframe: &str,
+        start_date: Option<&str>,
+        end_date: Option<&str>,
+    ) -> Result<Self, ReaderError> {
+        let symbol = Symbol::parse(symbol)?;
+        let timeframe = Timeframe::parse(timeframe)?;
+        let start = parse_opt_date("start_date", start_date)?;
+        let end = parse_opt_date("end_date", end_date)?;
+        if let (Some(s), Some(e)) = (start, end)
+            && s > e
+        {
+            return Err(ReaderError::Config(format!(
+                "start_date {s} is after end_date {e}"
+            )));
+        }
+        Ok(Self {
+            market,
+            dir: dir.as_ref().to_path_buf(),
+            symbol,
+            timeframe,
+            start_date: start,
+            end_date: end,
+        })
+    }
+
+    /// Binance market path.
+    #[must_use]
+    pub fn market(&self) -> Market {
+        self.market
+    }
+
+    /// Data root; the reader appends `binance/data/{market}/...`.
+    #[must_use]
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// Borrow the validated symbol.
+    #[must_use]
+    pub fn symbol(&self) -> &Symbol {
+        &self.symbol
+    }
+
+    /// Borrow the validated timeframe.
+    #[must_use]
+    pub fn timeframe(&self) -> &Timeframe {
+        &self.timeframe
+    }
+
+    /// Inclusive lower date bound (UTC).
+    #[must_use]
+    pub fn start_date(&self) -> Option<NaiveDate> {
+        self.start_date
+    }
+
+    /// Inclusive upper date bound (UTC); covers the whole day.
+    #[must_use]
+    pub fn end_date(&self) -> Option<NaiveDate> {
+        self.end_date
+    }
+}
+
+impl TryFrom<RawKlineConfig> for KlineConfig {
+    type Error = ReaderError;
+
+    fn try_from(raw: RawKlineConfig) -> Result<Self, Self::Error> {
+        match raw.market {
+            Some(market) => Self::new_with_market(
+                market,
+                &raw.dir,
+                &raw.symbol,
+                &raw.timeframe,
+                raw.start_date.as_deref(),
+                raw.end_date.as_deref(),
+            ),
+            None => Self::new(
+                &raw.dir,
+                &raw.symbol,
+                &raw.timeframe,
+                raw.start_date.as_deref(),
+                raw.end_date.as_deref(),
+            ),
+        }
     }
 }
 
@@ -429,5 +580,37 @@ timeframe = "1m"
         )
         .unwrap();
         assert_eq!(cfg.market(), Market::Cm);
+    }
+
+    #[test]
+    fn kline_config_toml_roundtrip() {
+        let toml_str = r#"
+market = "spot"
+dir = "/data"
+symbol = "BTCUSDT"
+timeframe = "1h"
+"#;
+        let cfg: KlineConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.market(), Market::Spot);
+        assert_eq!(cfg.dir(), Path::new("/data"));
+        assert_eq!(cfg.symbol().as_str(), "BTCUSDT");
+        assert_eq!(cfg.timeframe().as_str(), "1h");
+        assert_eq!(cfg.timeframe().interval_ms(), 3_600_000);
+    }
+
+    #[test]
+    fn kline_config_rejects_bad_input() {
+        assert!(KlineConfig::new("/data", "", "1h", None, None).is_err());
+        assert!(KlineConfig::new("/data", "BTCUSDT", "D1", None, None).is_err());
+        assert!(
+            KlineConfig::new(
+                "/data",
+                "BTCUSDT",
+                "1h",
+                Some("2025-01-02"),
+                Some("2025-01-01")
+            )
+            .is_err()
+        );
     }
 }

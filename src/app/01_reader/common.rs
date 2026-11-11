@@ -413,7 +413,7 @@ fn load_single_zip<T>(
     let mut archive = zip::ZipArchive::new(file)?;
     let mut csv_index = None;
     for index in 0..archive.len() {
-        let name = archive.by_index(index)?.name().to_owned();
+        let name = archive.by_index(index)?.name()?.into_owned();
         if is_csv_entry(&name) {
             csv_index = Some(index);
             break;

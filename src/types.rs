@@ -1,4 +1,5 @@
-//! Domain enums and newtypes: market, dataset family, interval and symbol.
+//! Domain enums and newtypes: market, dataset family, interval, symbol and
+//! kline timeframe.
 
 use std::fmt;
 use std::str::FromStr;
@@ -319,6 +320,100 @@ impl AsRef<str> for Symbol {
     }
 }
 
+/// Single source of truth: timeframe → expected bar interval in milliseconds.
+/// Both config validation and the gap check read this table.
+const TIMEFRAME_INTERVALS_MS: &[(&str, i64)] = &[
+    ("1m", 60_000),
+    ("3m", 180_000),
+    ("5m", 300_000),
+    ("15m", 900_000),
+    ("30m", 1_800_000),
+    ("1h", 3_600_000),
+    ("2h", 7_200_000),
+    ("4h", 14_400_000),
+    ("6h", 21_600_000),
+    ("8h", 28_800_000),
+    ("12h", 43_200_000),
+    ("1d", 86_400_000),
+];
+
+/// Binance kline archive timeframes accepted by [`Timeframe`].
+const BINANCE_TIMEFRAMES: &[&str] = &[
+    "1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "8h", "12h", "1d",
+];
+
+/// Interval lookup: unknown timeframes return `None`.
+#[must_use]
+pub fn interval_ms_for(timeframe: &str) -> Option<i64> {
+    TIMEFRAME_INTERVALS_MS
+        .iter()
+        .find(|(tf, _)| *tf == timeframe)
+        .map(|(_, ms)| *ms)
+}
+
+/// Whether `timeframe` is supported by Binance kline archives.
+#[must_use]
+pub fn is_supported(timeframe: &str) -> bool {
+    BINANCE_TIMEFRAMES.contains(&timeframe)
+}
+
+/// List of supported Binance kline timeframes.
+#[must_use]
+pub fn supported_timeframes() -> &'static [&'static str] {
+    BINANCE_TIMEFRAMES
+}
+
+/// Validated kline timeframe; construction binds the expected bar interval.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Timeframe {
+    raw: String,
+    interval_ms: i64,
+}
+
+impl Timeframe {
+    /// Parse and validate a Binance kline timeframe.
+    pub fn parse(s: impl AsRef<str>) -> Result<Self, ReaderError> {
+        let s = s.as_ref().trim();
+        if !is_supported(s) {
+            return Err(ReaderError::Config(format!(
+                "unsupported binance timeframe: {s}, valid values: {:?}",
+                supported_timeframes()
+            )));
+        }
+        let interval_ms = interval_ms_for(s).ok_or_else(|| {
+            ReaderError::Config(format!("no interval defined for timeframe: {s}"))
+        })?;
+        Ok(Self {
+            raw: s.to_owned(),
+            interval_ms,
+        })
+    }
+
+    /// Borrow the raw timeframe string.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.raw
+    }
+
+    /// Configured bar interval in milliseconds.
+    #[must_use]
+    pub const fn interval_ms(&self) -> i64 {
+        self.interval_ms
+    }
+}
+
+impl fmt::Display for Timeframe {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.raw)
+    }
+}
+
+impl AsRef<str> for Timeframe {
+    fn as_ref(&self) -> &str {
+        &self.raw
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -399,5 +494,23 @@ mod tests {
         ] {
             assert_eq!(Symbol::parse(valid).unwrap().as_str(), valid);
         }
+    }
+
+    #[test]
+    fn timeframe_accepts_binance_whitelist() {
+        assert!(Timeframe::parse("1m").is_ok());
+        assert!(Timeframe::parse("1d").is_ok());
+        assert_eq!(Timeframe::parse(" 4h ").unwrap().as_str(), "4h");
+        assert!(Timeframe::parse("D1").is_err());
+        assert!(Timeframe::parse("3d").is_err());
+    }
+
+    #[test]
+    fn timeframe_binds_interval() {
+        assert_eq!(Timeframe::parse("1m").unwrap().interval_ms(), 60_000);
+        assert_eq!(Timeframe::parse("1d").unwrap().interval_ms(), 86_400_000);
+        assert_eq!(interval_ms_for("1h"), Some(3_600_000));
+        assert_eq!(interval_ms_for("D1"), None);
+        assert!(supported_timeframes().contains(&"1d"));
     }
 }

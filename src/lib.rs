@@ -1,9 +1,11 @@
-//! Load Binance public-archive datasets that `kline-reader` does not cover
-//! into typed column vectors.
+//! Load Binance public-archive data into typed column vectors.
 //!
-//! Covered families: `indexPriceKlines`/`markPriceKlines`/
-//! `premiumIndexKlines`, `aggTrades`, `trades`, `bookTicker`, `bookDepth`,
-//! `fundingRate`, `metrics`, and `liquidationSnapshot`.
+//! Two loaders are exposed:
+//!
+//! - [`load_columns`] reads one symbol × one dataset (non-kline archive
+//!   families plus index/mark/premium klines) into [`DatasetColumns`].
+//! - [`load_kline_columns`] reads one symbol × one timeframe of regular klines
+//!   into [`KlineColumns`] (OHLCV).
 //!
 //! See the crate README for layout and configuration details.
 
@@ -11,20 +13,28 @@ mod app;
 mod config;
 mod error;
 mod python;
+#[cfg(test)]
+#[path = "test_helpers.rs"]
+mod test_helpers;
 mod types;
 
 pub use app::{
     AggTradeColumns, BookDepthColumns, BookTickerColumns, DatasetColumns, FundingRateColumns,
-    KlineColumns, LiquidationColumns, MetricsColumns, TradeColumns, load_columns,
+    KlineColumns, KlineDatasetColumns, LiquidationColumns, MetricsColumns, TradeColumns,
+    load_columns, load_kline_columns,
 };
-pub use config::DataConfig;
+pub use config::{DataConfig, KlineConfig};
 pub use error::{ReaderError, Result};
 use pyo3::prelude::*;
-pub use types::{Dataset, Interval, Market, Symbol};
+pub use types::{
+    Dataset, Interval, Market, Symbol, Timeframe, interval_ms_for, is_supported,
+    supported_timeframes,
+};
 
-/// Python extension module (`maturin build` → `import binance_reader`).
+/// Python extension module (`maturin build` → `import binance_data_reader`).
 #[pymodule]
-fn binance_reader(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn binance_data_reader(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(python::py_load_columns, m)?)?;
+    m.add_function(wrap_pyfunction!(python::py_load_kline_columns, m)?)?;
     Ok(())
 }

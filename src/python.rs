@@ -1,15 +1,16 @@
-//! Python bindings (`pyo3`, abi3): `load_columns(dict) -> dict`.
+//! Python bindings (`pyo3`, abi3).
 //!
-//! The dict mirrors `DataConfig` and returns the dataset's column lists plus a
-//! `"dataset"` tag. Parsing happens once at this boundary
-//! (`DataConfig::new_with_market`); invalid input raises `ValueError`.
+//! - `load_columns(dict) -> dict`: dataset columns plus a `"dataset"` tag.
+//! - `load_kline_columns(dict) -> dict`: regular OHLCV kline columns.
+//!
+//! Parsing happens once at this boundary; invalid input raises `ValueError`.
 
 use pyo3::exceptions::{PyKeyError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
 use crate::DatasetColumns;
-use crate::config::DataConfig;
+use crate::config::{DataConfig, KlineConfig};
 use crate::error::ReaderError;
 use crate::types::{Dataset, Market};
 
@@ -19,7 +20,7 @@ fn py_err(e: ReaderError) -> PyErr {
 
 fn extract_required<'py, T>(config: &Bound<'py, PyDict>, key: &str) -> PyResult<T>
 where
-    T: FromPyObject<'py>,
+    T: for<'a> FromPyObject<'a, 'py>,
 {
     config
         .get_item(key)?
@@ -30,7 +31,7 @@ where
 
 fn extract_optional<'py, T>(config: &Bound<'py, PyDict>, key: &str) -> PyResult<Option<T>>
 where
-    T: FromPyObject<'py>,
+    T: for<'a> FromPyObject<'a, 'py>,
 {
     let Some(value) = config.get_item(key)? else {
         return Ok(None);
@@ -82,6 +83,42 @@ pub(crate) fn py_load_columns(config: &Bound<'_, PyDict>) -> PyResult<Py<PyAny>>
     .map_err(|e| PyValueError::new_err(e.to_string()))?;
     let columns = crate::app::load_columns(&data_cfg).map_err(py_err)?;
     Python::attach(|py| columns_to_dict(py, &columns))
+}
+
+/// Load one symbol × one timeframe of Binance klines as OHLCV columns.
+#[pyfunction]
+#[pyo3(name = "load_kline_columns", signature = (config))]
+pub(crate) fn py_load_kline_columns(config: &Bound<'_, PyDict>) -> PyResult<Py<PyAny>> {
+    let dir: String = extract_required(config, "dir")?;
+    let market: Option<String> = extract_optional(config, "market")?;
+    let symbol: String = extract_required(config, "symbol")?;
+    let timeframe: String = extract_required(config, "timeframe")?;
+    let start_date: Option<String> = extract_optional(config, "start_date")?;
+    let end_date: Option<String> = extract_optional(config, "end_date")?;
+    let market = match market.as_deref() {
+        Some(raw) => raw.parse::<Market>().map_err(PyValueError::new_err)?,
+        None => Market::default(),
+    };
+    let data_cfg = KlineConfig::new_with_market(
+        market,
+        &dir,
+        &symbol,
+        &timeframe,
+        start_date.as_deref(),
+        end_date.as_deref(),
+    )
+    .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let cols = crate::app::load_kline_columns(&data_cfg).map_err(py_err)?;
+    Python::attach(|py| {
+        let out = PyDict::new(py);
+        out.set_item("time", cols.time())?;
+        out.set_item("open", cols.open())?;
+        out.set_item("high", cols.high())?;
+        out.set_item("low", cols.low())?;
+        out.set_item("close", cols.close())?;
+        out.set_item("volume", cols.volume())?;
+        Ok(out.into())
+    })
 }
 
 fn columns_to_dict(py: Python<'_>, columns: &DatasetColumns) -> PyResult<Py<PyAny>> {

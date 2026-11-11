@@ -3,9 +3,10 @@ requires = ["maturin>=1.9.4"]
 build-backend = "maturin"
 
 [project]
-name = "binance-reader"
+name = "binance-data-reader"
 version = "0.1.0"
 requires-python = ">=3.9"
 
 [tool.maturin]
 bindings = "pyo3"
+module-name = "binance_data_reader"

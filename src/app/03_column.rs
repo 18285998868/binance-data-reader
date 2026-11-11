@@ -10,7 +10,7 @@ use crate::types::Dataset;
 
 /// OHLCV columns for index/mark/premium klines.
 #[derive(Debug, Clone)]
-pub struct KlineColumns {
+pub struct KlineDatasetColumns {
     dataset: Dataset,
     time: Vec<i64>,
     open: Vec<f64>,
@@ -20,7 +20,7 @@ pub struct KlineColumns {
     volume: Vec<f64>,
 }
 
-impl KlineColumns {
+impl KlineDatasetColumns {
     pub(crate) fn from_records(records: Vec<KlineRecord>, dataset: Dataset) -> Self {
         let n = records.len();
         let mut columns = Self {
@@ -428,7 +428,7 @@ macro_rules! impl_len_is_empty {
 }
 
 impl_len_is_empty!(
-    KlineColumns,
+    KlineDatasetColumns,
     AggTradeColumns,
     TradeColumns,
     BookTickerColumns,
@@ -636,7 +636,7 @@ impl From<Vec<MetricsRecord>> for MetricsColumns {
 #[derive(Debug, Clone)]
 pub enum DatasetColumns {
     /// Index/mark/premium klines.
-    Klines(KlineColumns),
+    Klines(KlineDatasetColumns),
     /// Aggregate trades.
     AggTrades(AggTradeColumns),
     /// Individual trades.
@@ -707,7 +707,7 @@ impl DatasetColumns {
 
     /// Borrow kline columns, or `None` for any other dataset.
     #[must_use]
-    pub fn as_klines(&self) -> Option<&KlineColumns> {
+    pub fn as_klines(&self) -> Option<&KlineDatasetColumns> {
         match self {
             Self::Klines(columns) => Some(columns),
             _ => None,

@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use tempfile::TempDir;
 
-use binance_reader::{DataConfig, Dataset, Market, ReaderError, load_columns};
+use binance_data_reader::{DataConfig, Dataset, Market, ReaderError, load_columns};
 
 mod common;
 
