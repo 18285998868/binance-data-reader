@@ -39,9 +39,9 @@
 //! - `python` (off by default): build the `binance_data_reader` extension
 //!   module with `read(config)` and `catalog(root, ...)`.
 //!
-//! # MSRV
+//! # Toolchain
 //!
-//! Rust 1.89, edition 2024.
+//! Latest stable Rust, edition 2024 (`rust-toolchain.toml`).
 //!
 //! # Example
 //!

@@ -9,7 +9,7 @@
 
 ## 模块一：构建
 
-1. Rust 1.89+。
+1. 最新 stable 工具链（见 `rust-toolchain.toml`）。
 2. 构建 release 二进制。
 3. 运行离线门禁。
 
