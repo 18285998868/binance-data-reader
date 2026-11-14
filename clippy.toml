@@ -1,0 +1,8 @@
+# Clippy-specific configuration only; lint levels live in Cargo.toml.
+#
+# Tests may unwrap/expect/panic for brevity. These switches keep the
+# restriction lints enabled for production paths without special-casing every
+# test call site.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true

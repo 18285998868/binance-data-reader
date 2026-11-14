@@ -1,104 +1,120 @@
 # binance-data-reader
 
-> 从本地 Binance 公共归档加载数据为列向量。只负责加载、读取、清洗数据；
-> 格式转换由下游自行处理。
-
-## 两套入口
-
-| 入口 | 配置 | 输出 |
-| --- | --- | --- |
-| `load_columns(&DataConfig)` | 非 K 线数据集，另含 index/mark/premium klines | `DatasetColumns` |
-| `load_kline_columns(&KlineConfig)` | 普通 OHLCV K 线 | `KlineColumns` |
-
-数据布局与 `binance-data-downloader` 一致（`dir` 为 `binance/` 的父目录）：
+把 `binance-data-downloader` 产出的本地归档读成命名、带类型的列式表。
+`root` 是下载器的 `output_dir`（含 `data/` 的那一层），布局固定为：
 
 ```text
-{dir}/binance/data/{spot|futures/um|futures/cm}/{daily|monthly}/{dataset}/{symbol}[/{interval}]/*.zip
+{root}/data/{market}/{daily|monthly}/{dataset}/{symbol}[/{interval}]/*.zip
 ```
 
-普通 K 线：
+## 模块一：构建
 
-```text
-{dir}/binance/data/{market}/daily/klines/{symbol}/{timeframe}/*.zip
+1. Rust 1.89+。
+2. 构建 release 二进制。
+3. 运行离线门禁。
+
+```bash
+cargo build --release
+./scripts/check.sh
 ```
 
-## 数据集
+## 模块二：读取数据
 
-| `dataset` | spot | futures/um | futures/cm | 档位 |
-| --- | --- | --- | --- | --- |
-| `aggTrades` | ✅ | ✅ | ✅ | daily / monthly |
-| `trades` | ✅ | ✅ | ✅ | daily / monthly |
-| `bookTicker` | ❌ | ✅ | ✅ | daily / monthly |
-| `bookDepth` | ❌ | ✅ | ✅ | daily |
-| `fundingRate` | ❌ | ✅ | ✅ | monthly |
-| `liquidationSnapshot` | ❌ | ❌ | ✅ | daily |
-| `metrics` | ❌ | ✅ | ✅ | daily |
-| `indexPriceKlines` | ❌ | ✅ | ✅ | daily / monthly |
-| `markPriceKlines` | ❌ | ✅ | ✅ | daily / monthly |
-| `premiumIndexKlines` | ❌ | ✅ | ✅ | daily / monthly |
+1. 复制并修改示例请求。
+2. CLI 只把 JSON 写 stdout，日志写 stderr。
+3. 退出码：`0` 成功，`2` 配置/JSON 错误，`1` I/O 或数据错误。
 
-- `indexPriceKlines` 按标的指数存放：`BTCUSD_PERP` 读取 `indexPriceKlines/BTCUSD`，
-  `BTCUSDT_250926` 读取 `BTCUSDT`。
-- reader 同时扫描 `daily` 与 `monthly`，重叠数据按主键去重。
-- `DatasetColumns` 由 `dataset` 标签区分具体列集；K 线形态数据集使用
-  `KlineDatasetColumns`（保留 `dataset` 字段）。
+```bash
+cp config/00.example.toml /tmp/request.toml
+./target/release/binance-data-reader read -c /tmp/request.toml > /tmp/data.json
+```
 
-## 配置
+> 省略的日期边界表示不设限。`start_date`/`end_date` 是包含端点的 UTC 日期。
 
-数据集示例见 `config.example.toml`，普通 K 线见 `config.kline.example.toml`。
+## 模块三：查看归档清单
+
+1. 过滤条件全部可选。
+2. 输出 `{root, entries}`，每个条目给出文件数与首末周期。
+
+```bash
+./target/release/binance-data-reader list --root /data/data/binance --dataset klines
+```
+
+## 模块四：Rust 库
+
+1. 构造并校验 `Config`。
+2. `read` 返回 `DatasetData { table, report }`。
+3. 按归档列名取列。
 
 ```rust
-let cfg: DataConfig = toml::from_str(&config_str)?;
-let columns = load_columns(&cfg)?;
+use binance_data_reader::{Config, Dataset, read};
 
-let cfg: KlineConfig = toml::from_str(&kline_config_str)?;
-let bars = load_kline_columns(&cfg)?;
+let config = Config::builder("/data/data/binance", Dataset::Klines, "BTCUSDT")
+    .interval("1m".parse()?)
+    .date_range(
+        Some("2023-06-01".parse()?),
+        Some("2023-06-30".parse()?),
+    )
+    .build()?;
+let data = read(&config)?;
+let closes = data.table.f64("close").unwrap_or_default();
+assert_eq!(data.table.len(), data.report.rows);
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-日期语义为 UTC，`end_date` 含当日整天。构造 `DataConfig`/`KlineConfig` 时完成
-全部校验（市场、品种、周期、日期范围），非法输入直接返回 `ReaderError::Config`。
+## 模块五：Python
 
-## Python
+1. 用 maturin 构建 `python` feature。
+2. `read(config)` 接受 TOML 路径或 dict。
+3. `catalog(root, ...)` 返回清单列表。
+
+```bash
+python -m pip install maturin
+maturin develop --features python
+```
 
 ```python
-import binance_data_reader
+import binance_data_reader as r
 
-cols = binance_data_reader.load_columns({
-    "dataset": "metrics",
-    "dir": "path/to/data",
-    "symbol": "BTCUSDT",
-})
-
-bars = binance_data_reader.load_kline_columns({
-    "dir": "path/to/data",
-    "symbol": "BTCUSDT",
-    "timeframe": "1d",
-})
+data = r.read({"root": "/data/data/binance", "dataset": "trades",
+               "symbol": "BTCUSDT", "market": "futures/um",
+               "start_date": "2023-06-01", "end_date": "2023-06-30"})
+print(data["report"]["rows"], list(data["columns"]))
 ```
 
-Python 绑定只负责解析参数并调用对应 Rust 接口。
+## 模块六：输出结构
 
-## 处理语义
+1. `columns` 是 `{归档列名: 数组}`；空字段是 `null`。
+2. `report` 记录文件数、解码/重叠/窗口/跳过行数、去重数、首末时间和 K 线缺口。
+3. 不丢字段：K 线 12 列、spot `is_best_match`、COIN-M `base_qty`、metrics 的 symbol 与可空比率都会返回。
 
-- 单文件硬失败零容忍：损坏 zip、缺失 CSV、非法文件名日期 → 整批 `Err`。
-- 行级坏数据 warn 并跳过（留样上限 5）。
-- 普通 K 线：全局按 `open_time` 排序、去重 keep-first、缺口只报告不填充；
-  日期裁剪为 `[start 00:00, end 次日 00:00)`。
-- 数据集：按各自主键排序去重（K 线按 `open_time`，成交按 ID）。
-
-## 架构
-
-```text
-src/
-  lib.rs                 导出 + PyO3 模块
-  config.rs              DataConfig / KlineConfig
-  types.rs               Market / Dataset / Interval / Symbol / Timeframe
-  app/mod.rs             两个入口与共享清洗
-  app/01_reader/         各数据集 reader + 普通 K 线 reader
-  app/02_clean*.rs       数据集去重 / K 线去重与缺口检查
-  app/03_column*.rs      数据集列集 / OHLCV 列集
-tests/                   zip 归档集成测试
+```json
+{"dataset":"klines","columns":{"open_time":[...],"close":[...]},
+ "report":{"rows":43200,"rows_dropped_overlap":8640,"gaps":0}}
 ```
 
-依赖：`zip`、`csv`、`chrono`、`rayon`、`serde`、`thiserror`、`tracing`、
-`pyo3`（abi3-py39）。无 `unsafe`。
+## 模块七：严格性与合并规则
+
+1. 文件名、ZIP 内容、CSV header、每行时间必须匹配请求和文件周期。
+2. 默认 `bad_rows = "fail"`；`skip` 只跳过坏行，文件级损坏始终失败。
+3. daily 与 monthly 都扫描；daily 覆盖的 UTC 日丢弃 monthly 行；被 daily 全覆盖的 monthly 文件直接跳过读取.
+4. K 线要求严格递增且 `close_time` 与 interval 一致；缺口只计数不填充。
+5. liquidationSnapshot 的全行精确重复会去重并写入 `duplicates_removed`。
+
+## 模块八：验收
+
+1. 离线门禁 + 真实归档冒烟。
+2. 冒烟请求固定为 BTCUSDT USD-M 1m 2023-06，期望 43,200 行。
+
+```bash
+cargo build --release
+./target/release/binance-data-reader read -c config/00.smoke.toml > /tmp/smoke.json
+unzip -p /data/data/binance/data/futures/um/monthly/klines/BTCUSDT/1m/BTCUSDT-1m-2023-06.zip | wc -l
+```
+
+## 模块九：文档
+
+1. 执行路径见 [STEP.md](./STEP.md)。
+2. 版本与破坏性变更见 [CHANGELOG.md](./CHANGELOG.md)。
+3. 设计取舍见 [docs/adr/](./docs/adr/)。
+4. 许可证：MIT。

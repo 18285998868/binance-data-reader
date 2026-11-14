@@ -1,0 +1,30 @@
+# Full reader request with every supported field.
+#
+# `root` is the downloader's `output_dir`, i.e. the directory containing `data/`.
+# The reader appends `data/{market}/{daily|monthly}/{dataset}/{symbol}[/{interval}]`.
+
+# Required: archive root. This is NOT the `.../binance` parent.
+root = "/data/data/binance"
+
+# Required: one of aggTrades, trades, klines, bookDepth, bookTicker,
+# fundingRate, liquidationSnapshot, metrics, indexPriceKlines,
+# markPriceKlines, premiumIndexKlines.
+dataset = "klines"
+
+# Required: uppercase ASCII letters, digits and `_` (e.g. BTCUSDT, BTCUSD_PERP).
+symbol = "BTCUSDT"
+
+# Optional: spot, futures/um (default) or futures/cm.
+market = "futures/um"
+
+# Required for kline-shaped datasets, forbidden otherwise.
+# One of 1s, 1m, 3m, 5m, 15m, 30m, 1h, 2h, 4h, 6h, 8h, 12h, 1d, 3d, 1w, 1mo.
+interval = "1m"
+
+# Optional inclusive UTC date window; omit either side for "unbounded".
+start_date = "2023-06-01"
+end_date = "2023-06-30"
+
+# Optional: fail (default) aborts on the first malformed row;
+# skip drops malformed rows, counts them and keeps up to five samples.
+bad_rows = "fail"

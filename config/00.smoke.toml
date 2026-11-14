@@ -1,0 +1,13 @@
+# Real-data acceptance request: BTCUSDT USD-M 1m klines for June 2023.
+#
+# Expected: 6 daily files (2023-06-25..30) + 1 monthly file (2023-06),
+# 43_200 rows after daily-over-monthly merge, first open_time 1685577600000.
+
+root = "/data/data/binance"
+dataset = "klines"
+symbol = "BTCUSDT"
+market = "futures/um"
+interval = "1m"
+start_date = "2023-06-01"
+end_date = "2023-06-30"
+bad_rows = "fail"

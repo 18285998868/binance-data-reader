@@ -1,280 +1,174 @@
-//! Python bindings (`pyo3`, abi3).
+//! Python bindings (`python` feature, built with maturin).
 //!
-//! - `load_columns(dict) -> dict`: dataset columns plus a `"dataset"` tag.
-//! - `load_kline_columns(dict) -> dict`: regular OHLCV kline columns.
+//! Two functions are exposed:
 //!
-//! Parsing happens once at this boundary; invalid input raises `ValueError`.
+//! - `read(config)` where `config` is a TOML path or a dict, returning
+//!   `{"dataset": str, "columns": {name: list}, "report": dict}`;
+//! - `catalog(root, market=None, period=None, dataset=None, symbol=None)`,
+//!   returning the catalog as Python dictionaries.
+//!
+//! No compatibility layer is provided for the old
+//! `load_columns`/`load_kline_columns` API; downstream code should adapt to the
+//! column-name based shape.
 
-use pyo3::exceptions::{PyKeyError, PyTypeError, PyValueError};
+use std::path::PathBuf;
+use std::str::FromStr;
+
+use chrono::NaiveDate;
+use pyo3::IntoPyObjectExt;
+use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
+use pyo3::types::{PyDict, PyList};
+use serde::Serialize;
+use serde_json::Value;
 
-use crate::DatasetColumns;
-use crate::config::{DataConfig, KlineConfig};
-use crate::error::ReaderError;
-use crate::types::{Dataset, Market};
+use crate::{BadRowPolicy, CatalogFilter, Config, Dataset, Interval, Market};
 
-fn py_err(e: ReaderError) -> PyErr {
-    pyo3::exceptions::PyRuntimeError::new_err(e.to_string())
+#[pymodule]
+fn binance_data_reader(module: &Bound<'_, PyModule>) -> PyResult<()> {
+    module.add_function(wrap_pyfunction!(read, module)?)?;
+    module.add_function(wrap_pyfunction!(catalog, module)?)?;
+    Ok(())
 }
 
-fn extract_required<'py, T>(config: &Bound<'py, PyDict>, key: &str) -> PyResult<T>
-where
-    T: for<'a> FromPyObject<'a, 'py>,
-{
-    config
-        .get_item(key)?
-        .ok_or_else(|| PyKeyError::new_err(format!("missing required config key: {key}")))?
-        .extract()
-        .map_err(|_| PyTypeError::new_err(format!("config[{key}] has wrong type")))
-}
-
-fn extract_optional<'py, T>(config: &Bound<'py, PyDict>, key: &str) -> PyResult<Option<T>>
-where
-    T: for<'a> FromPyObject<'a, 'py>,
-{
-    let Some(value) = config.get_item(key)? else {
-        return Ok(None);
-    };
-    if value.is_none() {
-        return Ok(None);
-    }
-    value
-        .extract()
-        .map(Some)
-        .map_err(|_| PyTypeError::new_err(format!("config[{key}] has wrong type")))
-}
-
-fn extract_dataset(config: &Bound<'_, PyDict>) -> PyResult<Dataset> {
-    if config.contains("dataset")? {
-        let raw: String = extract_required(config, "dataset")?;
-        raw.parse::<Dataset>().map_err(PyValueError::new_err)
-    } else if config.contains("type")? {
-        let raw: String = extract_required(config, "type")?;
-        raw.parse::<Dataset>().map_err(PyValueError::new_err)
-    } else {
-        Err(PyKeyError::new_err("missing required config key: dataset"))
-    }
-}
-
+/// Read a dataset and return a Python dictionary.
 #[pyfunction]
-#[pyo3(name = "load_columns", signature = (config))]
-pub(crate) fn py_load_columns(config: &Bound<'_, PyDict>) -> PyResult<Py<PyAny>> {
-    let dataset = extract_dataset(config)?;
-    let dir: String = extract_required(config, "dir")?;
-    let symbol: String = extract_required(config, "symbol")?;
-    let market: Option<String> = extract_optional(config, "market")?;
-    let interval: Option<String> = extract_optional(config, "interval")?;
-    let start_date: Option<String> = extract_optional(config, "start_date")?;
-    let end_date: Option<String> = extract_optional(config, "end_date")?;
-    let market = match market.as_deref() {
-        Some(raw) => raw.parse::<Market>().map_err(PyValueError::new_err)?,
-        None => Market::default(),
-    };
-    let data_cfg = DataConfig::new_with_market(
-        dataset,
-        market,
-        &dir,
-        &symbol,
-        interval.as_deref(),
-        start_date.as_deref(),
-        end_date.as_deref(),
-    )
-    .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let columns = crate::app::load_columns(&data_cfg).map_err(py_err)?;
-    Python::attach(|py| columns_to_dict(py, &columns))
+fn read(py: Python<'_>, config: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+    let config = parse_config(config)?;
+    let data = crate::read(&config).map_err(to_pyerr)?;
+    let result = PyDict::new(py);
+    result.set_item("dataset", config.dataset().as_str())?;
+    result.set_item("columns", json_to_py(py, &to_json(&data.table)?)?)?;
+    result.set_item("report", json_to_py(py, &to_json(&data.report)?)?)?;
+    Ok(result.into_any().unbind())
 }
 
-/// Load one symbol × one timeframe of Binance klines as OHLCV columns.
+/// Return the archive inventory as a list of dictionaries.
 #[pyfunction]
-#[pyo3(name = "load_kline_columns", signature = (config))]
-pub(crate) fn py_load_kline_columns(config: &Bound<'_, PyDict>) -> PyResult<Py<PyAny>> {
-    let dir: String = extract_required(config, "dir")?;
-    let market: Option<String> = extract_optional(config, "market")?;
-    let symbol: String = extract_required(config, "symbol")?;
-    let timeframe: String = extract_required(config, "timeframe")?;
-    let start_date: Option<String> = extract_optional(config, "start_date")?;
-    let end_date: Option<String> = extract_optional(config, "end_date")?;
-    let market = match market.as_deref() {
-        Some(raw) => raw.parse::<Market>().map_err(PyValueError::new_err)?,
-        None => Market::default(),
+#[pyo3(signature = (root, market=None, period=None, dataset=None, symbol=None))]
+fn catalog(
+    py: Python<'_>,
+    root: &str,
+    market: Option<String>,
+    period: Option<String>,
+    dataset: Option<String>,
+    symbol: Option<String>,
+) -> PyResult<Py<PyAny>> {
+    let filter = CatalogFilter {
+        market: parse_filter(market, "market")?,
+        period: parse_filter(period, "period")?,
+        dataset: parse_filter(dataset, "dataset")?,
+        symbol: parse_filter(symbol, "symbol")?,
     };
-    let data_cfg = KlineConfig::new_with_market(
-        market,
-        &dir,
-        &symbol,
-        &timeframe,
-        start_date.as_deref(),
-        end_date.as_deref(),
-    )
-    .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let cols = crate::app::load_kline_columns(&data_cfg).map_err(py_err)?;
-    Python::attach(|py| {
-        let out = PyDict::new(py);
-        out.set_item("time", cols.time())?;
-        out.set_item("open", cols.open())?;
-        out.set_item("high", cols.high())?;
-        out.set_item("low", cols.low())?;
-        out.set_item("close", cols.close())?;
-        out.set_item("volume", cols.volume())?;
-        Ok(out.into())
+    let catalog = crate::catalog(std::path::Path::new(root), &filter).map_err(to_pyerr)?;
+    json_to_py(py, &to_json(&catalog)?)
+}
+
+fn parse_filter<T: FromStr<Err = String>>(raw: Option<String>, field: &str) -> PyResult<Option<T>> {
+    raw.map(|value| {
+        value
+            .parse::<T>()
+            .map_err(|e| PyValueError::new_err(format!("{field}: {e}")))
     })
+    .transpose()
 }
 
-fn columns_to_dict(py: Python<'_>, columns: &DatasetColumns) -> PyResult<Py<PyAny>> {
-    let out = PyDict::new(py);
-    out.set_item("dataset", columns.dataset().as_str())?;
-    match columns {
-        DatasetColumns::Klines(columns) => {
-            out.set_item("time", columns.time())?;
-            out.set_item("open", columns.open())?;
-            out.set_item("high", columns.high())?;
-            out.set_item("low", columns.low())?;
-            out.set_item("close", columns.close())?;
-            out.set_item("volume", columns.volume())?;
-        }
-        DatasetColumns::AggTrades(columns) => {
-            out.set_item("time", columns.time())?;
-            out.set_item("agg_trade_id", columns.agg_trade_id())?;
-            out.set_item("price", columns.price())?;
-            out.set_item("quantity", columns.quantity())?;
-            out.set_item("first_trade_id", columns.first_trade_id())?;
-            out.set_item("last_trade_id", columns.last_trade_id())?;
-            out.set_item("is_buyer_maker", columns.is_buyer_maker())?;
-        }
-        DatasetColumns::Trades(columns) => {
-            out.set_item("time", columns.time())?;
-            out.set_item("trade_id", columns.trade_id())?;
-            out.set_item("price", columns.price())?;
-            out.set_item("qty", columns.qty())?;
-            if let Some(quote_qty) = columns.quote_qty() {
-                out.set_item("quote_qty", quote_qty)?;
-            }
-            if let Some(base_qty) = columns.base_qty() {
-                out.set_item("base_qty", base_qty)?;
-            }
-            out.set_item("is_buyer_maker", columns.is_buyer_maker())?;
-        }
-        DatasetColumns::BookTicker(columns) => {
-            out.set_item("time", columns.time())?;
-            out.set_item("update_id", columns.update_id())?;
-            out.set_item("best_bid_price", columns.best_bid_price())?;
-            out.set_item("best_bid_qty", columns.best_bid_qty())?;
-            out.set_item("best_ask_price", columns.best_ask_price())?;
-            out.set_item("best_ask_qty", columns.best_ask_qty())?;
-            out.set_item("transaction_time", columns.transaction_time())?;
-        }
-        DatasetColumns::BookDepth(columns) => {
-            out.set_item("time", columns.time())?;
-            out.set_item("percentage", columns.percentage())?;
-            out.set_item("depth", columns.depth())?;
-            out.set_item("notional", columns.notional())?;
-        }
-        DatasetColumns::FundingRate(columns) => {
-            out.set_item("time", columns.time())?;
-            out.set_item("funding_interval_hours", columns.funding_interval_hours())?;
-            out.set_item("last_funding_rate", columns.last_funding_rate())?;
-        }
-        DatasetColumns::LiquidationSnapshot(columns) => {
-            out.set_item("time", columns.time())?;
-            out.set_item("side", columns.side().to_vec())?;
-            out.set_item("order_type", columns.order_type().to_vec())?;
-            out.set_item("time_in_force", columns.time_in_force().to_vec())?;
-            out.set_item("original_quantity", columns.original_quantity())?;
-            out.set_item("price", columns.price())?;
-            out.set_item("average_price", columns.average_price())?;
-            out.set_item("order_status", columns.order_status().to_vec())?;
-            out.set_item("last_fill_quantity", columns.last_fill_quantity())?;
-            out.set_item(
-                "accumulated_fill_quantity",
-                columns.accumulated_fill_quantity(),
-            )?;
-        }
-        DatasetColumns::Metrics(columns) => {
-            out.set_item("time", columns.time())?;
-            out.set_item("sum_open_interest", columns.sum_open_interest())?;
-            out.set_item("sum_open_interest_value", columns.sum_open_interest_value())?;
-            out.set_item(
-                "count_toptrader_long_short_ratio",
-                columns.count_toptrader_long_short_ratio().to_vec(),
-            )?;
-            out.set_item(
-                "sum_toptrader_long_short_ratio",
-                columns.sum_toptrader_long_short_ratio().to_vec(),
-            )?;
-            out.set_item(
-                "count_long_short_ratio",
-                columns.count_long_short_ratio().to_vec(),
-            )?;
-            out.set_item(
-                "sum_taker_long_short_vol_ratio",
-                columns.sum_taker_long_short_vol_ratio().to_vec(),
-            )?;
-        }
+fn parse_config(value: &Bound<'_, PyAny>) -> PyResult<Config> {
+    if let Ok(path) = value.extract::<PathBuf>() {
+        return Config::from_toml_file(path).map_err(to_pyerr);
     }
-    Ok(out.into())
+    let dict = value.cast::<PyDict>()?;
+
+    let root = required_string(dict, "root")?;
+    let dataset_raw = required_string(dict, "dataset")?;
+    let dataset = dataset_raw
+        .parse::<Dataset>()
+        .map_err(PyValueError::new_err)?;
+    let symbol = required_string(dict, "symbol")?;
+    let mut builder = Config::builder(root, dataset, symbol);
+
+    if let Some(market) = optional_string(dict, "market")? {
+        builder = builder.market(market.parse::<Market>().map_err(PyValueError::new_err)?);
+    }
+    if let Some(interval) = optional_string(dict, "interval")? {
+        builder = builder.interval(
+            interval
+                .parse::<Interval>()
+                .map_err(PyValueError::new_err)?,
+        );
+    }
+    builder = builder.date_range(
+        optional_date(dict, "start_date")?,
+        optional_date(dict, "end_date")?,
+    );
+    if let Some(policy) = optional_string(dict, "bad_rows")? {
+        builder = builder.bad_rows(
+            policy
+                .parse::<BadRowPolicy>()
+                .map_err(PyValueError::new_err)?,
+        );
+    }
+    builder.build().map_err(to_pyerr)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn missing_dataset_errors() {
-        Python::initialize();
-        Python::attach(|py| {
-            let config = PyDict::new(py);
-            let err = py_load_columns(&config).unwrap_err();
-            assert!(err.to_string().contains("missing required config key"));
-        });
+fn optional_string(dict: &Bound<'_, PyDict>, key: &str) -> PyResult<Option<String>> {
+    match dict.get_item(key)? {
+        Some(value) if !value.is_none() => Ok(Some(value.extract::<String>()?)),
+        _ => Ok(None),
     }
+}
 
-    #[test]
-    fn invalid_dataset_errors() {
-        Python::initialize();
-        Python::attach(|py| {
-            let config = PyDict::new(py);
-            config.set_item("dataset", "klines").unwrap();
-            config.set_item("dir", "/tmp").unwrap();
-            config.set_item("symbol", "X").unwrap();
-            let err = py_load_columns(&config).unwrap_err();
-            assert!(err.to_string().contains("unsupported dataset"));
-        });
-    }
+fn required_string(dict: &Bound<'_, PyDict>, key: &str) -> PyResult<String> {
+    optional_string(dict, key)?
+        .ok_or_else(|| PyValueError::new_err(format!("missing config key: {key}")))
+}
 
-    #[test]
-    fn optional_none_is_accepted() {
-        Python::initialize();
-        Python::attach(|py| {
-            let config = PyDict::new(py);
-            config.set_item("interval", py.None()).unwrap();
-            let interval = extract_optional::<String>(&config, "interval").unwrap();
-            assert!(interval.is_none());
-        });
-    }
+fn optional_date(dict: &Bound<'_, PyDict>, key: &str) -> PyResult<Option<NaiveDate>> {
+    optional_string(dict, key)?
+        .map(|raw| {
+            NaiveDate::parse_from_str(&raw, "%Y-%m-%d")
+                .map_err(|e| PyValueError::new_err(format!("{key}: {e}")))
+        })
+        .transpose()
+}
 
-    #[test]
-    fn optional_wrong_type_is_rejected() {
-        Python::initialize();
-        Python::attach(|py| {
-            let config = PyDict::new(py);
-            config.set_item("interval", 1).unwrap();
-            let error = extract_optional::<String>(&config, "interval").unwrap_err();
-            assert!(error.to_string().contains("wrong type"));
-        });
-    }
+fn to_json<T: Serialize>(value: &T) -> PyResult<Value> {
+    serde_json::to_value(value).map_err(|error| to_pyerr(error.into()))
+}
 
-    #[test]
-    fn non_kline_interval_errors() {
-        Python::initialize();
-        Python::attach(|py| {
-            let config = PyDict::new(py);
-            config.set_item("dataset", "metrics").unwrap();
-            config.set_item("dir", "/tmp").unwrap();
-            config.set_item("symbol", "X").unwrap();
-            config.set_item("interval", "1m").unwrap();
-            let err = py_load_columns(&config).unwrap_err();
-            assert!(err.to_string().contains("does not take interval"));
-        });
+fn to_pyerr(error: crate::Error) -> PyErr {
+    PyRuntimeError::new_err(error.to_string())
+}
+
+fn json_to_py(py: Python<'_>, value: &Value) -> PyResult<Py<PyAny>> {
+    match value {
+        Value::Null => Ok(py.None()),
+        Value::Bool(value) => value.into_py_any(py),
+        Value::Number(number) => {
+            if let Some(value) = number.as_i64() {
+                value.into_py_any(py)
+            } else if let Some(value) = number.as_u64() {
+                value.into_py_any(py)
+            } else if let Some(value) = number.as_f64() {
+                value.into_py_any(py)
+            } else {
+                Err(PyValueError::new_err("JSON number out of range"))
+            }
+        }
+        Value::String(value) => value.as_str().into_py_any(py),
+        Value::Array(items) => {
+            let list = PyList::empty(py);
+            for item in items {
+                list.append(json_to_py(py, item)?)?;
+            }
+            Ok(list.into_any().unbind())
+        }
+        Value::Object(map) => {
+            let dict = PyDict::new(py);
+            for (key, item) in map {
+                dict.set_item(key.as_str(), json_to_py(py, item)?)?;
+            }
+            Ok(dict.into_any().unbind())
+        }
     }
 }

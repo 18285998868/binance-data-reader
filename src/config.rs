@@ -1,616 +1,447 @@
-//! Configuration for one symbol × one dataset.
+//! Request configuration: TOML files, a typed builder and validation.
 //!
-//! TOML is first deserialized into an unvalidated intermediate form, then
-//! validated exactly once at the [`DataConfig`] boundary. The programmatic
-//! constructors apply the same rules.
+//! Configuration is validated exactly once. [`Config`] has private fields and
+//! can only be produced through [`ConfigBuilder::build`], [`Config::from_toml_str`]
+//! or [`Config::from_toml_file`], so every function that takes `&Config` can
+//! rely on the support matrix, interval requirement and date order.
 
-use std::fmt;
 use std::path::{Path, PathBuf};
 
 use chrono::NaiveDate;
 use serde::Deserialize;
 
-use crate::error::ReaderError;
-use crate::types::{Dataset, Interval, Market, Symbol, Timeframe};
+use crate::error::{Error, Result};
+use crate::types::{BadRowPolicy, Dataset, Interval, Market, Symbol};
 
-/// TOML intermediate representation: strings only, no validation.
+/// A validated request for one symbol × one dataset.
 ///
-/// Required fields (`dataset`/`dir`/`symbol`) fail deserialization when
-/// missing. `dataset` also accepts the legacy `type` key, matching the
-/// downloader config that spells the dataset family as `type`.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawDataConfig {
-    #[serde(alias = "type")]
-    dataset: Dataset,
-    /// Optional Binance market; defaults to `futures/um`.
-    #[serde(default)]
-    market: Option<Market>,
-    dir: PathBuf,
-    symbol: String,
-    /// Required by kline-shaped datasets, rejected by every other dataset.
-    interval: Option<String>,
-    start_date: Option<String>,
-    end_date: Option<String>,
-}
-
-fn parse_opt_date(label: &str, v: Option<&str>) -> Result<Option<NaiveDate>, ReaderError> {
-    match v {
-        None => Ok(None),
-        Some(s) => NaiveDate::parse_from_str(s, "%Y-%m-%d")
-            .map(Some)
-            .map_err(|_| ReaderError::Config(format!("invalid {label} (want YYYY-MM-DD): {s}"))),
-    }
-}
-
-/// Single-symbol × single-dataset load configuration; construction validates.
+/// # Examples
 ///
-/// - `dataset/market/symbol/interval` are validated against the archive
-///   support matrix;
-/// - `start_date/end_date` are parsed dates and satisfy `start <= end`;
-/// - TOML field names are stable; validation happens once at the
-///   deserialization boundary via `TryFrom<RawDataConfig>`.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(try_from = "RawDataConfig")]
-pub struct DataConfig {
-    dataset: Dataset,
+/// ```
+/// use binance_data_reader::{Config, Dataset};
+///
+/// let config = Config::builder("/data/data/binance", Dataset::Klines, "BTCUSDT")
+///     .interval("1m".parse()?)
+///     .build()?;
+/// assert_eq!(config.symbol().as_str(), "BTCUSDT");
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+#[derive(Debug, Clone)]
+pub struct Config {
+    root: PathBuf,
     market: Market,
-    dir: PathBuf,
+    dataset: Dataset,
     symbol: Symbol,
     interval: Option<Interval>,
     start_date: Option<NaiveDate>,
     end_date: Option<NaiveDate>,
+    bad_rows: BadRowPolicy,
 }
 
-impl DataConfig {
-    /// Dataset family, e.g. [`Dataset::AggTrades`].
+impl Config {
+    /// Start building a request for `symbol`.
+    ///
+    /// The market defaults to [`Market::Um`]; call [`ConfigBuilder::market`] to
+    /// change it.
     #[must_use]
-    pub fn dataset(&self) -> Dataset {
+    pub fn builder(
+        root: impl Into<PathBuf>,
+        dataset: Dataset,
+        symbol: impl AsRef<str>,
+    ) -> ConfigBuilder {
+        ConfigBuilder {
+            root: root.into(),
+            market: Market::Um,
+            dataset,
+            symbol: symbol.as_ref().to_owned(),
+            interval: None,
+            start_date: None,
+            end_date: None,
+            bad_rows: BadRowPolicy::Fail,
+        }
+    }
+
+    /// Parse and validate a TOML document.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Config`] when the TOML is invalid, a field is unknown,
+    /// the dataset is not published for the market, an interval is missing or
+    /// forbidden, or the date range is reversed.
+    pub fn from_toml_str(raw: &str) -> Result<Self> {
+        let parsed: RawConfig =
+            toml::from_str(raw).map_err(|e| Error::Config(format!("TOML: {e}")))?;
+        let mut builder = Self::builder(parsed.root, parsed.dataset, parsed.symbol.as_str())
+            .market(parsed.market.unwrap_or_default())
+            .bad_rows(parsed.bad_rows.unwrap_or_default());
+        if let Some(interval) = parsed.interval {
+            builder = builder.interval(interval);
+        }
+        if parsed.start_date.is_some() || parsed.end_date.is_some() {
+            builder = builder.date_range(parsed.start_date, parsed.end_date);
+        }
+        builder.build()
+    }
+
+    /// Read, parse and validate a TOML file.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Io`] when the file cannot be read and the same errors
+    /// as [`Config::from_toml_str`] otherwise.
+    pub fn from_toml_file(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let raw = std::fs::read_to_string(path)
+            .map_err(|e| Error::io(format!("read config {}", path.display()), e))?;
+        Self::from_toml_str(&raw).map_err(|e| match e {
+            Error::Config(message) => Error::Config(format!("{}: {message}", path.display())),
+            other => other,
+        })
+    }
+
+    /// Archive root, i.e. the downloader's `output_dir`.
+    ///
+    /// The reader appends `data/{market}/{period}/...`; do not include the
+    /// `data` segment here.
+    #[must_use]
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// Market to read.
+    #[must_use]
+    pub const fn market(&self) -> Market {
+        self.market
+    }
+
+    /// Dataset family to read.
+    #[must_use]
+    pub const fn dataset(&self) -> Dataset {
         self.dataset
     }
 
-    /// Binance market path.
-    #[must_use]
-    pub fn market(&self) -> Market {
-        self.market
-    }
-
-    /// Data root; the reader appends `binance/data/{market}/...`.
-    #[must_use]
-    pub fn dir(&self) -> &Path {
-        &self.dir
-    }
-
-    /// Borrow the validated symbol.
+    /// Symbol to read, exactly as the archive spells it.
     #[must_use]
     pub fn symbol(&self) -> &Symbol {
         &self.symbol
     }
 
-    /// Borrow the validated interval, present only for kline-shaped datasets.
+    /// Kline interval; present exactly when [`Dataset::needs_interval`].
     #[must_use]
-    pub fn interval(&self) -> Option<&Interval> {
-        self.interval.as_ref()
+    pub const fn interval(&self) -> Option<Interval> {
+        self.interval
     }
 
-    /// Inclusive lower date bound (UTC).
+    /// Inclusive UTC start date.
     #[must_use]
-    pub fn start_date(&self) -> Option<NaiveDate> {
+    pub const fn start_date(&self) -> Option<NaiveDate> {
         self.start_date
     }
 
-    /// Inclusive upper date bound (UTC); covers the whole day.
+    /// Inclusive UTC end date.
     #[must_use]
-    pub fn end_date(&self) -> Option<NaiveDate> {
+    pub const fn end_date(&self) -> Option<NaiveDate> {
         self.end_date
     }
-}
 
-impl DataConfig {
-    /// Programmatic constructor with the default `futures/um` market.
-    ///
-    /// `interval` is required by index/mark/premium klines and must be `None`
-    /// for every other dataset.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ReaderError::Config`] when the dataset/market pair is
-    /// unsupported, the symbol or interval is invalid, an interval is missing
-    /// or forbidden, or the date range is malformed or reversed.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use binance_data_reader::{DataConfig, Dataset};
-    ///
-    /// let cfg = DataConfig::new(
-    ///     Dataset::AggTrades,
-    ///     "/data",
-    ///     "BTCUSDT",
-    ///     None,
-    ///     Some("2024-01-01"),
-    ///     Some("2024-01-31"),
-    /// )?;
-    /// assert_eq!(cfg.dataset(), Dataset::AggTrades);
-    /// # Ok::<(), binance_data_reader::ReaderError>(())
-    /// ```
-    pub fn new(
-        dataset: Dataset,
-        dir: impl AsRef<Path>,
-        symbol: &str,
-        interval: Option<&str>,
-        start_date: Option<&str>,
-        end_date: Option<&str>,
-    ) -> Result<Self, ReaderError> {
-        Self::build(
-            dataset,
-            Market::Um,
-            dir,
-            symbol,
-            interval,
-            start_date,
-            end_date,
-        )
-    }
-
-    /// Same as [`Self::new`], with an explicit market.
-    ///
-    /// # Errors
-    ///
-    /// Same validation rules as [`Self::new`], including the dataset/market
-    /// support matrix check.
-    pub fn new_with_market(
-        dataset: Dataset,
-        market: Market,
-        dir: impl AsRef<Path>,
-        symbol: &str,
-        interval: Option<&str>,
-        start_date: Option<&str>,
-        end_date: Option<&str>,
-    ) -> Result<Self, ReaderError> {
-        Self::build(dataset, market, dir, symbol, interval, start_date, end_date)
-    }
-
-    fn build(
-        dataset: Dataset,
-        market: Market,
-        dir: impl AsRef<Path>,
-        symbol: &str,
-        interval: Option<&str>,
-        start_date: Option<&str>,
-        end_date: Option<&str>,
-    ) -> Result<Self, ReaderError> {
-        if !dataset.supports(market) {
-            return Err(ReaderError::Config(format!(
-                "dataset {} is not available for market {market}",
-                dataset.as_str()
-            )));
-        }
-        let symbol = Symbol::parse(symbol)?;
-        let interval = match (dataset.needs_interval(), interval) {
-            (true, Some(raw)) => Some(Interval::parse(market, raw)?),
-            (true, None) => {
-                return Err(ReaderError::Config(format!(
-                    "dataset {} requires interval",
-                    dataset.as_str()
-                )));
-            }
-            (false, Some(_)) => {
-                return Err(ReaderError::Config(format!(
-                    "dataset {} does not take interval",
-                    dataset.as_str()
-                )));
-            }
-            (false, None) => None,
-        };
-        let start = parse_opt_date("start_date", start_date)?;
-        let end = parse_opt_date("end_date", end_date)?;
-        if let (Some(s), Some(e)) = (start, end)
-            && s > e
-        {
-            return Err(ReaderError::Config(format!(
-                "start_date {s} is after end_date {e}"
-            )));
-        }
-        Ok(Self {
-            dataset,
-            market,
-            dir: dir.as_ref().to_path_buf(),
-            symbol,
-            interval,
-            start_date: start,
-            end_date: end,
-        })
+    /// Row-level damage policy.
+    #[must_use]
+    pub const fn bad_rows(&self) -> BadRowPolicy {
+        self.bad_rows
     }
 }
 
-impl TryFrom<RawDataConfig> for DataConfig {
-    type Error = ReaderError;
-
-    fn try_from(raw: RawDataConfig) -> Result<Self, Self::Error> {
-        Self::new_with_market(
-            raw.dataset,
-            raw.market.unwrap_or_default(),
-            &raw.dir,
-            &raw.symbol,
-            raw.interval.as_deref(),
-            raw.start_date.as_deref(),
-            raw.end_date.as_deref(),
-        )
-    }
-}
-
-impl fmt::Display for DataConfig {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "{} {} {} {}",
-            self.dataset.as_str(),
-            self.market,
-            self.symbol,
-            self.interval.as_ref().map_or("*", Interval::as_str)
-        )
-    }
-}
-
-/// TOML intermediate form for [`KlineConfig`].
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawKlineConfig {
-    /// Optional Binance market; defaults to `futures/um`.
-    #[serde(default)]
-    market: Option<Market>,
-    dir: PathBuf,
-    symbol: String,
-    timeframe: String,
-    start_date: Option<String>,
-    end_date: Option<String>,
-}
-
-/// One symbol × one timeframe kline load configuration (Binance archives).
+/// Builder for [`Config`].
 ///
-/// Construction validates the market, symbol, timeframe and date range.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(try_from = "RawKlineConfig")]
-pub struct KlineConfig {
+/// [`ConfigBuilder::build`] performs every cross-field check, so intermediate
+/// states are intentionally unvalidated.
+#[derive(Debug, Clone)]
+pub struct ConfigBuilder {
+    root: PathBuf,
     market: Market,
-    dir: PathBuf,
-    symbol: Symbol,
-    timeframe: Timeframe,
+    dataset: Dataset,
+    symbol: String,
+    interval: Option<Interval>,
     start_date: Option<NaiveDate>,
     end_date: Option<NaiveDate>,
+    bad_rows: BadRowPolicy,
 }
 
-impl KlineConfig {
-    /// Programmatic constructor using the default `futures/um` market.
+impl ConfigBuilder {
+    /// Set the market (default [`Market::Um`]).
+    #[must_use]
+    pub fn market(mut self, market: Market) -> Self {
+        self.market = market;
+        self
+    }
+
+    /// Set the kline interval.
+    ///
+    /// Required for kline-shaped datasets and forbidden for the others.
+    #[must_use]
+    pub fn interval(mut self, interval: Interval) -> Self {
+        self.interval = Some(interval);
+        self
+    }
+
+    /// Set an inclusive UTC date range; `None` means unbounded on that side.
+    #[must_use]
+    pub fn date_range(mut self, start: Option<NaiveDate>, end: Option<NaiveDate>) -> Self {
+        self.start_date = start;
+        self.end_date = end;
+        self
+    }
+
+    /// Set the row-level damage policy (default [`BadRowPolicy::Fail`]).
+    #[must_use]
+    pub fn bad_rows(mut self, policy: BadRowPolicy) -> Self {
+        self.bad_rows = policy;
+        self
+    }
+
+    /// Validate the request and produce a [`Config`].
     ///
     /// # Errors
     ///
-    /// Returns [`ReaderError::Config`] for an invalid symbol/timeframe or a
-    /// malformed/reversed date range.
-    pub fn new(
-        dir: impl AsRef<Path>,
-        symbol: &str,
-        timeframe: &str,
-        start_date: Option<&str>,
-        end_date: Option<&str>,
-    ) -> Result<Self, ReaderError> {
-        Self::build(Market::Um, dir, symbol, timeframe, start_date, end_date)
-    }
+    /// Returns [`Error::Config`] with a specific reason when a field is
+    /// invalid or the dataset/interval is not published for the market.
+    pub fn build(self) -> Result<Config> {
+        let root = self.root;
+        if root.as_os_str().is_empty() {
+            return Err(Error::Config("root must not be empty".to_owned()));
+        }
+        let symbol =
+            Symbol::parse(&self.symbol).map_err(|e| Error::Config(format!("symbol: {e}")))?;
+        let dataset = self.dataset;
+        let market = self.market;
 
-    /// Same as [`Self::new`] with an explicit market.
-    ///
-    /// # Errors
-    ///
-    /// Same validation rules as [`Self::new`].
-    pub fn new_with_market(
-        market: Market,
-        dir: impl AsRef<Path>,
-        symbol: &str,
-        timeframe: &str,
-        start_date: Option<&str>,
-        end_date: Option<&str>,
-    ) -> Result<Self, ReaderError> {
-        Self::build(market, dir, symbol, timeframe, start_date, end_date)
-    }
-
-    fn build(
-        market: Market,
-        dir: impl AsRef<Path>,
-        symbol: &str,
-        timeframe: &str,
-        start_date: Option<&str>,
-        end_date: Option<&str>,
-    ) -> Result<Self, ReaderError> {
-        let symbol = Symbol::parse(symbol)?;
-        let timeframe = Timeframe::parse(timeframe)?;
-        let start = parse_opt_date("start_date", start_date)?;
-        let end = parse_opt_date("end_date", end_date)?;
-        if let (Some(s), Some(e)) = (start, end)
-            && s > e
-        {
-            return Err(ReaderError::Config(format!(
-                "start_date {s} is after end_date {e}"
+        if !dataset.any_period_supported(market) {
+            return Err(Error::Config(format!(
+                "dataset {dataset} is not published for {market}; supported markets: {}",
+                supported_markets(dataset)
             )));
         }
-        Ok(Self {
+
+        let interval = match (dataset.needs_interval(), self.interval) {
+            (true, None) => {
+                return Err(Error::Config(format!(
+                    "dataset {dataset} requires an interval"
+                )));
+            }
+            (false, Some(interval)) => {
+                return Err(Error::Config(format!(
+                    "dataset {dataset} does not use an interval, got {interval}"
+                )));
+            }
+            (true, Some(interval)) if !interval.available_any(market) => {
+                return Err(Error::Config(format!(
+                    "interval {interval} is not published for {market}"
+                )));
+            }
+            (_, interval) => interval,
+        };
+
+        if let (Some(start), Some(end)) = (self.start_date, self.end_date)
+            && start > end
+        {
+            return Err(Error::Config(format!(
+                "start_date {start} is after end_date {end}"
+            )));
+        }
+
+        Ok(Config {
+            root,
             market,
-            dir: dir.as_ref().to_path_buf(),
+            dataset,
             symbol,
-            timeframe,
-            start_date: start,
-            end_date: end,
+            interval,
+            start_date: self.start_date,
+            end_date: self.end_date,
+            bad_rows: self.bad_rows,
         })
-    }
-
-    /// Binance market path.
-    #[must_use]
-    pub fn market(&self) -> Market {
-        self.market
-    }
-
-    /// Data root; the reader appends `binance/data/{market}/...`.
-    #[must_use]
-    pub fn dir(&self) -> &Path {
-        &self.dir
-    }
-
-    /// Borrow the validated symbol.
-    #[must_use]
-    pub fn symbol(&self) -> &Symbol {
-        &self.symbol
-    }
-
-    /// Borrow the validated timeframe.
-    #[must_use]
-    pub fn timeframe(&self) -> &Timeframe {
-        &self.timeframe
-    }
-
-    /// Inclusive lower date bound (UTC).
-    #[must_use]
-    pub fn start_date(&self) -> Option<NaiveDate> {
-        self.start_date
-    }
-
-    /// Inclusive upper date bound (UTC); covers the whole day.
-    #[must_use]
-    pub fn end_date(&self) -> Option<NaiveDate> {
-        self.end_date
     }
 }
 
-impl TryFrom<RawKlineConfig> for KlineConfig {
-    type Error = ReaderError;
+fn supported_markets(dataset: Dataset) -> String {
+    let markets: Vec<&str> = Market::ALL
+        .into_iter()
+        .filter(|market| dataset.any_period_supported(*market))
+        .map(Market::as_path)
+        .collect();
+    markets.join(", ")
+}
 
-    fn try_from(raw: RawKlineConfig) -> Result<Self, Self::Error> {
-        match raw.market {
-            Some(market) => Self::new_with_market(
-                market,
-                &raw.dir,
-                &raw.symbol,
-                &raw.timeframe,
-                raw.start_date.as_deref(),
-                raw.end_date.as_deref(),
-            ),
-            None => Self::new(
-                &raw.dir,
-                &raw.symbol,
-                &raw.timeframe,
-                raw.start_date.as_deref(),
-                raw.end_date.as_deref(),
-            ),
-        }
-    }
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawConfig {
+    root: PathBuf,
+    dataset: Dataset,
+    #[serde(default)]
+    market: Option<Market>,
+    symbol: Symbol,
+    #[serde(default)]
+    interval: Option<Interval>,
+    #[serde(default)]
+    start_date: Option<NaiveDate>,
+    #[serde(default)]
+    end_date: Option<NaiveDate>,
+    #[serde(default)]
+    bad_rows: Option<BadRowPolicy>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn toml_roundtrip_defaults() {
-        let toml_str = r#"
-dataset = "aggTrades"
-dir = "/data"
-symbol = "BTCUSDT"
-"#;
-        let cfg: DataConfig = toml::from_str(toml_str).unwrap();
-        assert_eq!(cfg.dataset(), Dataset::AggTrades);
-        assert_eq!(cfg.market(), Market::Um);
-        assert_eq!(cfg.dir(), Path::new("/data"));
-        assert_eq!(cfg.symbol().as_str(), "BTCUSDT");
-        assert!(cfg.interval().is_none());
-        assert!(cfg.start_date().is_none());
+    fn parse(raw: &str) -> Result<Config> {
+        Config::from_toml_str(raw)
     }
 
     #[test]
-    fn toml_accepts_type_alias() {
-        let toml_str = r#"
-type = "metrics"
-market = "futures/um"
-dir = "/data"
-symbol = "BTCUSDT"
-start_date = "2024-01-01"
-end_date = "2024-01-31"
-"#;
-        let cfg: DataConfig = toml::from_str(toml_str).unwrap();
-        assert_eq!(cfg.dataset(), Dataset::Metrics);
-        assert_eq!(
-            cfg.start_date(),
-            Some(NaiveDate::from_ymd_opt(2024, 1, 1).unwrap())
-        );
-        assert_eq!(
-            cfg.end_date(),
-            Some(NaiveDate::from_ymd_opt(2024, 1, 31).unwrap())
-        );
-    }
-
-    #[test]
-    fn toml_kline_shaped_requires_interval() {
-        let missing = r#"
-dataset = "indexPriceKlines"
-dir = "/data"
-symbol = "BTCUSDT"
-"#;
-        let err = toml::from_str::<DataConfig>(missing)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("requires interval"), "unexpected: {err}");
-
-        let ok = r#"
-dataset = "indexPriceKlines"
-dir = "/data"
-symbol = "BTCUSDT"
-interval = "4h"
-"#;
-        let cfg: DataConfig = toml::from_str(ok).unwrap();
-        assert_eq!(cfg.interval().unwrap().as_str(), "4h");
-    }
-
-    #[test]
-    fn toml_non_kline_rejects_interval() {
-        let toml_str = r#"
-dataset = "metrics"
-dir = "/data"
-symbol = "BTCUSDT"
-interval = "1m"
-"#;
-        let err = toml::from_str::<DataConfig>(toml_str)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("does not take interval"), "unexpected: {err}");
-    }
-
-    #[test]
-    fn toml_rejects_unsupported_market_pair() {
-        let toml_str = r#"
-dataset = "metrics"
-market = "spot"
-dir = "/data"
-symbol = "BTCUSDT"
-"#;
-        let err = toml::from_str::<DataConfig>(toml_str)
-            .unwrap_err()
-            .to_string();
-        assert!(
-            err.contains("not available for market"),
-            "unexpected: {err}"
-        );
-    }
-
-    #[test]
-    fn toml_rejects_missing_required_fields() {
-        let toml_str = r#"
-dir = "/data"
-symbol = "BTCUSDT"
-"#;
-        let err = toml::from_str::<DataConfig>(toml_str)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("dataset"), "unexpected: {err}");
-    }
-
-    #[test]
-    fn toml_rejects_unknown_fields() {
-        let toml_str = r#"
-dataset = "metrics"
-dir = "/data"
-symbol = "BTCUSDT"
-timeframe = "1m"
-"#;
-        assert!(toml::from_str::<DataConfig>(toml_str).is_err());
-    }
-
-    #[test]
-    fn toml_market_aliases() {
-        for raw in ["spot", "futures/um", "um", "futures/cm", "cm"] {
-            let market: Market = raw.parse().unwrap();
-            assert_eq!(market.to_string(), market.as_path());
-        }
-        assert!("nope".parse::<Market>().is_err());
-    }
-
-    #[test]
-    fn date_order_is_validated() {
-        let cfg = DataConfig::new(
-            Dataset::Trades,
-            "/data",
-            "BTCUSDT",
-            None,
-            Some("2024-02-01"),
-            Some("2024-01-01"),
-        );
-        assert!(cfg.is_err());
-    }
-
-    #[test]
-    fn constructor_rejects_symbol_path_traversal() {
-        let err = DataConfig::new(Dataset::Trades, "/data", "../../etc", None, None, None)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("invalid symbol"), "unexpected: {err}");
-    }
-
-    #[test]
-    fn constructor_rejects_bad_interval() {
-        assert!(
-            DataConfig::new(
-                Dataset::MarkPriceKlines,
-                "/data",
-                "BTCUSDT",
-                Some("2d"),
-                None,
-                None
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn cm_liquidation_is_accepted() {
-        let cfg = DataConfig::new_with_market(
-            Dataset::LiquidationSnapshot,
-            Market::Cm,
-            "/data",
-            "BTCUSD_PERP",
-            None,
-            None,
-            None,
+    fn toml_defaults_to_um_and_fail() {
+        let config = parse(
+            r#"
+            root = "/data/data/binance"
+            dataset = "trades"
+            symbol = "BTCUSDT"
+            start_date = "2024-01-01"
+            end_date = "2024-01-31"
+            "#,
         )
         .unwrap();
-        assert_eq!(cfg.market(), Market::Cm);
+        assert_eq!(config.market(), Market::Um);
+        assert_eq!(config.bad_rows(), BadRowPolicy::Fail);
+        assert_eq!(config.dataset(), Dataset::Trades);
+        assert_eq!(config.interval(), None);
     }
 
     #[test]
-    fn kline_config_toml_roundtrip() {
-        let toml_str = r#"
-market = "spot"
-dir = "/data"
-symbol = "BTCUSDT"
-timeframe = "1h"
-"#;
-        let cfg: KlineConfig = toml::from_str(toml_str).unwrap();
-        assert_eq!(cfg.market(), Market::Spot);
-        assert_eq!(cfg.dir(), Path::new("/data"));
-        assert_eq!(cfg.symbol().as_str(), "BTCUSDT");
-        assert_eq!(cfg.timeframe().as_str(), "1h");
-        assert_eq!(cfg.timeframe().interval_ms(), 3_600_000);
+    fn klines_require_an_interval() {
+        let error = parse(
+            r#"
+            root = "/data"
+            dataset = "klines"
+            symbol = "BTCUSDT"
+            "#,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("requires an interval"));
     }
 
     #[test]
-    fn kline_config_rejects_bad_input() {
-        assert!(KlineConfig::new("/data", "", "1h", None, None).is_err());
-        assert!(KlineConfig::new("/data", "BTCUSDT", "D1", None, None).is_err());
+    fn non_interval_dataset_rejects_interval() {
+        let error = parse(
+            r#"
+            root = "/data"
+            dataset = "metrics"
+            symbol = "BTCUSDT"
+            interval = "1m"
+            "#,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("does not use an interval"));
+    }
+
+    #[test]
+    fn unsupported_market_dataset_pairs_fail() {
+        let error = parse(
+            r#"
+            root = "/data"
+            dataset = "fundingRate"
+            market = "spot"
+            symbol = "BTCUSDT"
+            "#,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("not published"));
+    }
+
+    #[test]
+    fn unsupported_interval_fails() {
+        let error = parse(
+            r#"
+            root = "/data"
+            dataset = "klines"
+            market = "spot"
+            symbol = "BTCUSDT"
+            interval = "3d"
+            start_date = "2024-01-01"
+            "#,
+        );
+        // 3d exists in spot monthly archives, so this is valid.
+        assert!(error.is_ok());
+
+        let error = parse(
+            r#"
+            root = "/data"
+            dataset = "klines"
+            market = "futures/um"
+            symbol = "BTCUSDT"
+            interval = "1s"
+            "#,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("not published"));
+    }
+
+    #[test]
+    fn reversed_dates_fail() {
+        let error = parse(
+            r#"
+            root = "/data"
+            dataset = "trades"
+            symbol = "BTCUSDT"
+            start_date = "2024-02-01"
+            end_date = "2024-01-01"
+            "#,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("after end_date"));
+    }
+
+    #[test]
+    fn unknown_fields_and_bad_dates_fail() {
         assert!(
-            KlineConfig::new(
-                "/data",
-                "BTCUSDT",
-                "1h",
-                Some("2025-01-02"),
-                Some("2025-01-01")
+            parse(
+                r#"
+                root = "/data"
+                dataset = "trades"
+                symbol = "BTCUSDT"
+                typo = true
+                "#,
             )
             .is_err()
+        );
+        assert!(
+            parse(
+                r#"
+                root = "/data"
+                dataset = "trades"
+                symbol = "BTCUSDT"
+                start_date = "2024-13-01"
+                "#,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn builder_validates_symbol_and_interval() {
+        assert!(
+            Config::builder("/data", Dataset::Trades, "btcusdt")
+                .build()
+                .is_err()
+        );
+        assert!(
+            Config::builder("/data", Dataset::Klines, "BTCUSDT")
+                .build()
+                .is_err()
+        );
+        assert!(
+            Config::builder("/data", Dataset::Klines, "BTCUSDT")
+                .interval(Interval::M1)
+                .build()
+                .is_ok()
         );
     }
 }

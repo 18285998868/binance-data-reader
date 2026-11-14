@@ -1,0 +1,8 @@
+# Always track the latest stable toolchain.
+#
+# The build machines may default to an older toolchain than the dependency
+# tree requires; pinning `stable` here makes plain `cargo build` use the same
+# compiler everywhere without a manual version bump.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]

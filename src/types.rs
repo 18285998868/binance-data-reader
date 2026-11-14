@@ -1,29 +1,37 @@
-//! Domain enums and newtypes: market, dataset family, interval, symbol and
-//! kline timeframe.
+//! Archive vocabulary: market, cadence, dataset family, interval and symbol.
+//!
+//! Every value maps one-to-one onto a segment of the Binance public archive
+//! path and, because the downloader mirrors that layout, onto the local tree
+//! below [`Config::root`](crate::Config::root):
+//!
+//! ```text
+//! {root}/data/{market}/{period}/{dataset}/{symbol}[/{interval}]/{file}.zip
+//! ```
+//!
+//! There is deliberately no second layout.
 
 use std::fmt;
 use std::str::FromStr;
 
-use serde::Deserialize;
+use chrono::{DateTime, Datelike, Days, Months, NaiveDate};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::error::ReaderError;
-
-/// Binance market path segment below `<root>/binance/data`.
-///
-/// The downloader mirrors the archive layout, so the same value is used on
-/// disk: `spot`, `futures/um`, `futures/cm`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+/// Binance market, matching the archive path segment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub enum Market {
-    /// Spot market: `binance/data/spot/...`.
+    /// Spot market: `data/spot`.
     Spot,
-    /// USDⓈ-M futures: `binance/data/futures/um/...`.
+    /// USDⓈ-M futures: `data/futures/um`.
     #[default]
     Um,
-    /// COIN-M futures: `binance/data/futures/cm/...`.
+    /// COIN-M futures: `data/futures/cm`.
     Cm,
 }
 
 impl Market {
+    /// All supported markets.
+    pub const ALL: [Self; 3] = [Self::Spot, Self::Um, Self::Cm];
+
     /// Canonical path segment, e.g. `futures/um`.
     #[must_use]
     pub const fn as_path(self) -> &'static str {
@@ -44,9 +52,8 @@ impl fmt::Display for Market {
 impl FromStr for Market {
     type Err = String;
 
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            // Canonical archive paths, plus short aliases.
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        match raw {
             "spot" => Ok(Self::Spot),
             "futures/um" | "um" => Ok(Self::Um),
             "futures/cm" | "cm" => Ok(Self::Cm),
@@ -57,31 +64,149 @@ impl FromStr for Market {
     }
 }
 
+impl Serialize for Market {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_path())
+    }
+}
+
 impl<'de> Deserialize<'de> for Market {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let raw = String::deserialize(deserializer)?;
         raw.parse().map_err(serde::de::Error::custom)
     }
 }
 
-/// One Binance public-archive dataset family.
-///
-/// `klines` itself is intentionally absent: it is loaded by `kline-reader`.
-/// The kline-shaped index/mark/premium datasets live here because their
-/// archive layout and column shape match klines, not because they are klines.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// Archive cadence: one file per day or one file per month.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Period {
+    /// One file per UTC day, named `YYYY-MM-DD`.
+    Daily,
+    /// One file per UTC month, named `YYYY-MM`.
+    Monthly,
+}
+
+impl Period {
+    /// Both cadences, in scan order.
+    pub const ALL: [Self; 2] = [Self::Daily, Self::Monthly];
+
+    /// Archive path segment, e.g. `daily`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Daily => "daily",
+            Self::Monthly => "monthly",
+        }
+    }
+
+    /// Length of the date suffix in an archive file stem.
+    #[must_use]
+    pub const fn date_len(self) -> usize {
+        match self {
+            Self::Daily => 10,
+            Self::Monthly => 7,
+        }
+    }
+
+    /// First day of the period containing `date`.
+    #[must_use]
+    pub fn start_of(self, date: NaiveDate) -> NaiveDate {
+        match self {
+            Self::Daily => date,
+            Self::Monthly => date.with_day(1).unwrap_or(date),
+        }
+    }
+
+    /// First day after the period containing `date`.
+    #[must_use]
+    pub fn next_start(self, date: NaiveDate) -> Option<NaiveDate> {
+        match self {
+            Self::Daily => date.checked_add_days(Days::new(1)),
+            Self::Monthly => date.checked_add_months(Months::new(1)),
+        }
+    }
+
+    /// File-name date component, e.g. `2024-01-02` or `2024-01`.
+    #[must_use]
+    pub fn format(self, date: NaiveDate) -> String {
+        match self {
+            Self::Daily => date.format("%Y-%m-%d").to_string(),
+            Self::Monthly => date.format("%Y-%m").to_string(),
+        }
+    }
+
+    /// Parse the date suffix of an archive file stem.
+    ///
+    /// `BTCUSDT-1m-2024-01-02` (daily) and `BTCUSDT-1m-2024-01` (monthly)
+    /// both end in a date component. Symbols and dataset names never contain
+    /// `-`, so the suffix length identifies the cadence.
+    #[must_use]
+    pub fn parse_file_date(self, stem: &str) -> Option<Result<NaiveDate, String>> {
+        let len = self.date_len();
+        let start = stem.len().checked_sub(len)?;
+        let candidate = &stem[start..];
+        let shaped = match self {
+            Self::Daily => {
+                candidate.as_bytes().get(4) == Some(&b'-')
+                    && candidate.as_bytes().get(7) == Some(&b'-')
+            }
+            Self::Monthly => candidate.as_bytes().get(4) == Some(&b'-'),
+        };
+        if !shaped {
+            return None;
+        }
+        let parsed = match self {
+            Self::Daily => NaiveDate::parse_from_str(candidate, "%Y-%m-%d"),
+            // `%Y-%m` alone is ambiguous for chrono; pin the first day.
+            Self::Monthly => NaiveDate::parse_from_str(&format!("{candidate}-01"), "%Y-%m-%d"),
+        };
+        Some(parsed.map_err(|e| format!("invalid date suffix {candidate:?}: {e}")))
+    }
+}
+
+impl fmt::Display for Period {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for Period {
+    type Err = String;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        Self::ALL
+            .into_iter()
+            .find(|period| period.as_str() == raw)
+            .ok_or_else(|| format!("unsupported period: {raw}, valid values: daily, monthly"))
+    }
+}
+
+impl Serialize for Period {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for Period {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        raw.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+/// One archive dataset family, including regular klines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Dataset {
     /// Aggregate trades (`aggTrades`).
     AggTrades,
     /// Individual trades (`trades`).
     Trades,
-    /// Best bid/ask ticker (`bookTicker`).
-    BookTicker,
+    /// Klines (`klines`).
+    Klines,
     /// Order-book depth snapshots (`bookDepth`).
     BookDepth,
+    /// Best bid/ask ticker (`bookTicker`).
+    BookTicker,
     /// Funding rates (`fundingRate`).
     FundingRate,
     /// Liquidation snapshots (`liquidationSnapshot`).
@@ -98,11 +223,12 @@ pub enum Dataset {
 
 impl Dataset {
     /// All supported datasets, in archive-name order.
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::AggTrades,
         Self::Trades,
-        Self::BookTicker,
+        Self::Klines,
         Self::BookDepth,
+        Self::BookTicker,
         Self::FundingRate,
         Self::LiquidationSnapshot,
         Self::Metrics,
@@ -117,8 +243,9 @@ impl Dataset {
         match self {
             Self::AggTrades => "aggTrades",
             Self::Trades => "trades",
-            Self::BookTicker => "bookTicker",
+            Self::Klines => "klines",
             Self::BookDepth => "bookDepth",
+            Self::BookTicker => "bookTicker",
             Self::FundingRate => "fundingRate",
             Self::LiquidationSnapshot => "liquidationSnapshot",
             Self::Metrics => "metrics",
@@ -128,56 +255,88 @@ impl Dataset {
         }
     }
 
-    /// Whether the archive stores files below a `{interval}` directory.
+    /// Whether archive files live below an `{interval}` directory.
     #[must_use]
     pub const fn needs_interval(self) -> bool {
         matches!(
             self,
-            Self::IndexPriceKlines | Self::MarkPriceKlines | Self::PremiumIndexKlines
+            Self::Klines
+                | Self::IndexPriceKlines
+                | Self::MarkPriceKlines
+                | Self::PremiumIndexKlines
         )
     }
 
-    /// Whether prices may be zero or negative.
+    /// Whether premium-index prices may be zero or negative.
     ///
-    /// Premium-index values are rates around zero and are routinely negative;
-    /// every other dataset carries positive prices.
+    /// Premium-index values are rates around zero; every other dataset carries
+    /// positive prices.
     #[must_use]
     pub const fn allows_non_positive_price(self) -> bool {
         matches!(self, Self::PremiumIndexKlines)
     }
 
-    /// Whether the archive publishes this dataset for `market`.
+    /// Whether the archive publishes this dataset for a market/cadence pair.
+    ///
+    /// This mirrors the downloader's support matrix exactly.
     #[must_use]
-    pub const fn supports(self, market: Market) -> bool {
-        match self {
-            Self::AggTrades | Self::Trades => true,
-            Self::LiquidationSnapshot => matches!(market, Market::Cm),
-            Self::BookTicker
-            | Self::BookDepth
+    pub const fn supports(self, market: Market, period: Period) -> bool {
+        let market_ok = match self {
+            Self::AggTrades | Self::Trades | Self::Klines => true,
+            Self::BookDepth
+            | Self::BookTicker
             | Self::FundingRate
             | Self::Metrics
             | Self::IndexPriceKlines
             | Self::MarkPriceKlines
             | Self::PremiumIndexKlines => matches!(market, Market::Um | Market::Cm),
-        }
+            Self::LiquidationSnapshot => matches!(market, Market::Cm),
+        };
+        let period_ok = match self {
+            // Daily-only families.
+            Self::BookDepth | Self::Metrics | Self::LiquidationSnapshot => {
+                matches!(period, Period::Daily)
+            }
+            // Monthly-only family.
+            Self::FundingRate => matches!(period, Period::Monthly),
+            _ => true,
+        };
+        market_ok && period_ok
     }
 
-    /// Directory/file symbol for this dataset.
-    ///
-    /// `indexPriceKlines` is archived under the **underlying index** symbol,
-    /// not the contract: `BTCUSD_PERP` lives below `BTCUSD`, and
-    /// `BTCUSDT_250926` below `BTCUSDT`. Every other dataset uses the
-    /// configured symbol verbatim.
+    /// Whether any cadence publishes this dataset for `market`.
     #[must_use]
-    pub fn storage_symbol(self, symbol: &Symbol) -> &str {
+    pub const fn any_period_supported(self, market: Market) -> bool {
+        self.supports(market, Period::Daily) || self.supports(market, Period::Monthly)
+    }
+
+    /// Symbol used by the archive for this dataset.
+    ///
+    /// `indexPriceKlines` is keyed by the **underlying index**, not by the
+    /// contract: `BTCUSD_PERP` lives under `BTCUSD`, while a dated contract
+    /// such as `BTCUSDT_250926` lives under `BTCUSDT`. Every other dataset
+    /// uses the configured symbol verbatim.
+    #[must_use]
+    pub fn storage_symbol(self, symbol: &str) -> &str {
         if matches!(self, Self::IndexPriceKlines) {
-            symbol
-                .as_str()
-                .split_once('_')
-                .map_or(symbol.as_str(), |(underlying, _)| underlying)
+            underlying_index_symbol(symbol)
         } else {
-            symbol.as_str()
+            symbol
         }
+    }
+}
+
+/// Strip the contract suffix (`_PERP`, `_250926`, ...) to obtain the index
+/// symbol used by the archive's `indexPriceKlines` tree.
+fn underlying_index_symbol(symbol: &str) -> &str {
+    match symbol.rsplit_once('_') {
+        Some((base, suffix))
+            if suffix == "PERP"
+                || (suffix.len() == 6 && suffix.bytes().all(|b| b.is_ascii_digit())) =>
+        {
+            base
+        }
+        _ => symbol,
     }
 }
 
@@ -190,118 +349,240 @@ impl fmt::Display for Dataset {
 impl FromStr for Dataset {
     type Err = String;
 
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
         Self::ALL
             .into_iter()
-            .find(|dataset| dataset.as_str() == s)
+            .find(|dataset| dataset.as_str() == raw)
             .ok_or_else(|| {
                 let valid: Vec<&str> = Self::ALL.iter().map(|d| d.as_str()).collect();
-                format!("unsupported dataset: {s}, valid values: {valid:?}")
+                format!("unsupported dataset: {raw}, valid values: {valid:?}")
             })
     }
 }
 
+impl Serialize for Dataset {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
 impl<'de> Deserialize<'de> for Dataset {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let raw = String::deserialize(deserializer)?;
         raw.parse().map_err(serde::de::Error::custom)
     }
 }
 
-/// Intervals accepted by the kline-shaped datasets.
-const SPOT_INTERVALS: &[&str] = &[
-    "1s", "1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "8h", "12h", "1d", "3d", "1w",
-    "1mo",
-];
-const FUTURES_INTERVALS: &[&str] = &[
-    "1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "8h", "12h", "1d", "3d", "1w", "1mo",
-];
-
-/// Validated kline interval, matching the archive directory name.
-///
-/// Only used by [`Dataset::needs_interval`] datasets. `3d`, `1w` and `1mo`
-/// exist in monthly archives only; the reader scans both cadences, so no
-/// further restriction is needed here.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct Interval(String);
+/// Kline interval, matching archive directory names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Interval {
+    /// 1-second klines (spot only).
+    S1,
+    /// 1-minute klines.
+    M1,
+    /// 3-minute klines.
+    M3,
+    /// 5-minute klines.
+    M5,
+    /// 15-minute klines.
+    M15,
+    /// 30-minute klines.
+    M30,
+    /// 1-hour klines.
+    H1,
+    /// 2-hour klines.
+    H2,
+    /// 4-hour klines.
+    H4,
+    /// 6-hour klines.
+    H6,
+    /// 8-hour klines.
+    H8,
+    /// 12-hour klines.
+    H12,
+    /// 1-day klines.
+    D1,
+    /// 3-day klines (monthly archives only).
+    D3,
+    /// 1-week klines (monthly archives only).
+    W1,
+    /// 1-month klines (monthly archives only).
+    MO1,
+}
 
 impl Interval {
-    /// Parse and validate an interval for `market`.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ReaderError::Config`] when the trimmed value is not in the
-    /// market's interval allowlist.
-    pub fn parse(market: Market, s: impl AsRef<str>) -> Result<Self, ReaderError> {
-        let s = s.as_ref().trim();
-        let valid = match market {
-            Market::Spot => SPOT_INTERVALS,
-            Market::Um | Market::Cm => FUTURES_INTERVALS,
-        };
-        if !valid.contains(&s) {
-            return Err(ReaderError::Config(format!(
-                "unsupported {market} interval: {s}, valid values: {valid:?}"
-            )));
+    /// All accepted intervals, ordered by duration.
+    pub const ALL: [Self; 16] = [
+        Self::S1,
+        Self::M1,
+        Self::M3,
+        Self::M5,
+        Self::M15,
+        Self::M30,
+        Self::H1,
+        Self::H2,
+        Self::H4,
+        Self::H6,
+        Self::H8,
+        Self::H12,
+        Self::D1,
+        Self::D3,
+        Self::W1,
+        Self::MO1,
+    ];
+
+    /// Archive directory name, e.g. `1m`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::S1 => "1s",
+            Self::M1 => "1m",
+            Self::M3 => "3m",
+            Self::M5 => "5m",
+            Self::M15 => "15m",
+            Self::M30 => "30m",
+            Self::H1 => "1h",
+            Self::H2 => "2h",
+            Self::H4 => "4h",
+            Self::H6 => "6h",
+            Self::H8 => "8h",
+            Self::H12 => "12h",
+            Self::D1 => "1d",
+            Self::D3 => "3d",
+            Self::W1 => "1w",
+            Self::MO1 => "1mo",
         }
-        Ok(Self(s.to_owned()))
     }
 
-    /// Borrow the raw interval string.
+    /// Whether the archive publishes this interval for a market/cadence pair.
     #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
+    pub const fn available_for(self, market: Market, period: Period) -> bool {
+        match (market, period) {
+            (Market::Spot, Period::Daily) => self as u8 <= Self::D1 as u8,
+            (Market::Spot, Period::Monthly) => true,
+            (_, Period::Daily) => self as u8 >= Self::M1 as u8 && self as u8 <= Self::D1 as u8,
+            (_, Period::Monthly) => !matches!(self, Self::S1),
+        }
+    }
+
+    /// Fixed duration in milliseconds, or `None` for calendar months.
+    #[must_use]
+    pub const fn step_ms(self) -> Option<i64> {
+        let day = 86_400_000_i64;
+        match self {
+            Self::S1 => Some(1_000),
+            Self::M1 => Some(60_000),
+            Self::M3 => Some(3 * 60_000),
+            Self::M5 => Some(5 * 60_000),
+            Self::M15 => Some(15 * 60_000),
+            Self::M30 => Some(30 * 60_000),
+            Self::H1 => Some(60 * 60_000),
+            Self::H2 => Some(2 * 60 * 60_000),
+            Self::H4 => Some(4 * 60 * 60_000),
+            Self::H6 => Some(6 * 60 * 60_000),
+            Self::H8 => Some(8 * 60 * 60_000),
+            Self::H12 => Some(12 * 60 * 60_000),
+            Self::D1 => Some(day),
+            Self::D3 => Some(3 * day),
+            Self::W1 => Some(7 * day),
+            Self::MO1 => None,
+        }
+    }
+
+    /// Open time of the bar that follows the bar opened at `open_ms`.
+    ///
+    /// `1mo` advances by one calendar month so February, leap years and
+    /// 28/31-day months all line up with the archive.
+    #[must_use]
+    pub fn next_open(self, open_ms: i64) -> Option<i64> {
+        if let Some(step) = self.step_ms() {
+            return open_ms.checked_add(step);
+        }
+        let datetime = DateTime::from_timestamp_millis(open_ms)?;
+        let next = datetime.date_naive().checked_add_months(Months::new(1))?;
+        Some(next.and_hms_opt(0, 0, 0)?.and_utc().timestamp_millis())
+    }
+
+    /// Whether the archive publishes this interval for at least one cadence of
+    /// `market`.
+    #[must_use]
+    pub fn available_any(self, market: Market) -> bool {
+        self.available_for(market, Period::Daily) || self.available_for(market, Period::Monthly)
     }
 }
 
 impl fmt::Display for Interval {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
+        f.write_str(self.as_str())
     }
 }
 
-impl AsRef<str> for Interval {
-    fn as_ref(&self) -> &str {
-        &self.0
+impl FromStr for Interval {
+    type Err = String;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        Self::ALL
+            .into_iter()
+            .find(|interval| interval.as_str() == raw)
+            .ok_or_else(|| {
+                let valid: Vec<&str> = Self::ALL.iter().map(|i| i.as_str()).collect();
+                format!("unsupported interval: {raw}, valid values: {valid:?}")
+            })
     }
 }
 
-/// Validated Binance symbol.
+impl Serialize for Interval {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for Interval {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        raw.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+/// Validated Binance symbol used as a directory and file-name component.
 ///
-/// Symbols are ASCII letters, digits and `_` (e.g. `BTCUSDT`, `BTCUSD_PERP`,
-/// `BTCUSDT_250926`). The first character must be alphanumeric so the value is
-/// always safe as a single path component and [`Dataset::storage_symbol`]
-/// never yields an empty prefix. Keeping this a newtype means downstream
-/// functions never re-check the character set (`parse-don't-validate`).
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+/// Symbols are uppercase ASCII letters, digits and `_`; `-` is forbidden
+/// because it separates filename components. A symbol may start with a digit
+/// (`1000BONKUSDT`) but must contain at least one letter.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Symbol(String);
 
 impl Symbol {
-    /// Parse and validate a symbol.
+    /// Validate and own a symbol.
     ///
     /// # Errors
     ///
-    /// Returns [`ReaderError::Config`] when the trimmed value is empty, has a
-    /// non-alphanumeric first character, or contains anything other than
-    /// ASCII letters, digits and `_`.
-    pub fn parse(s: impl AsRef<str>) -> Result<Self, ReaderError> {
-        let trimmed = s.as_ref().trim();
-        if trimmed.is_empty() {
-            return Err(ReaderError::Config("symbol must not be empty".into()));
+    /// Returns a human-readable reason when the value is empty, longer than
+    /// 64 bytes, contains anything other than `A-Z`, `0-9` and `_`, or has no
+    /// letter at all.
+    pub fn parse(raw: impl AsRef<str>) -> Result<Self, String> {
+        let raw = raw.as_ref().trim();
+        if raw.is_empty() {
+            return Err("symbol must not be empty".to_owned());
         }
-        let mut chars = trimmed.chars();
-        let first_is_alphanumeric = chars.next().is_some_and(|c| c.is_ascii_alphanumeric());
-        if !first_is_alphanumeric || !chars.all(|c| c.is_ascii_alphanumeric() || c == '_') {
-            return Err(ReaderError::Config(format!(
-                "invalid symbol {trimmed:?}: use ASCII letters, digits and '_', starting with a letter or digit"
-            )));
+        if raw.len() > 64 {
+            return Err(format!("symbol is too long: {} bytes", raw.len()));
         }
-        Ok(Self(trimmed.to_owned()))
+        if !raw
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+        {
+            return Err(format!(
+                "symbol {raw:?} must contain only uppercase ASCII letters, digits and '_'"
+            ));
+        }
+        if !raw.bytes().any(|b| b.is_ascii_uppercase()) {
+            return Err(format!("symbol {raw:?} must contain at least one letter"));
+        }
+        Ok(Self(raw.to_owned()))
     }
 
-    /// Borrow the inner symbol string.
+    /// Borrow the symbol as a string slice.
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
@@ -314,203 +595,239 @@ impl fmt::Display for Symbol {
     }
 }
 
+impl FromStr for Symbol {
+    type Err = String;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        Self::parse(raw)
+    }
+}
+
 impl AsRef<str> for Symbol {
     fn as_ref(&self) -> &str {
         &self.0
     }
 }
 
-/// Single source of truth: timeframe → expected bar interval in milliseconds.
-/// Both config validation and the gap check read this table.
-const TIMEFRAME_INTERVALS_MS: &[(&str, i64)] = &[
-    ("1m", 60_000),
-    ("3m", 180_000),
-    ("5m", 300_000),
-    ("15m", 900_000),
-    ("30m", 1_800_000),
-    ("1h", 3_600_000),
-    ("2h", 7_200_000),
-    ("4h", 14_400_000),
-    ("6h", 21_600_000),
-    ("8h", 28_800_000),
-    ("12h", 43_200_000),
-    ("1d", 86_400_000),
-];
-
-/// Binance kline archive timeframes accepted by [`Timeframe`].
-const BINANCE_TIMEFRAMES: &[&str] = &[
-    "1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "8h", "12h", "1d",
-];
-
-/// Interval lookup: unknown timeframes return `None`.
-#[must_use]
-pub fn interval_ms_for(timeframe: &str) -> Option<i64> {
-    TIMEFRAME_INTERVALS_MS
-        .iter()
-        .find(|(tf, _)| *tf == timeframe)
-        .map(|(_, ms)| *ms)
+impl Serialize for Symbol {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.0)
+    }
 }
 
-/// Whether `timeframe` is supported by Binance kline archives.
-#[must_use]
-pub fn is_supported(timeframe: &str) -> bool {
-    BINANCE_TIMEFRAMES.contains(&timeframe)
+impl<'de> Deserialize<'de> for Symbol {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        Self::parse(&raw).map_err(serde::de::Error::custom)
+    }
 }
 
-/// List of supported Binance kline timeframes.
-#[must_use]
-pub fn supported_timeframes() -> &'static [&'static str] {
-    BINANCE_TIMEFRAMES
+/// How row-level data damage is handled.
+///
+/// File-level damage (corrupt ZIP, missing CSV entry, malformed filename) is
+/// always fatal. Row-level damage can be fatal or skipped; skipped rows are
+/// counted and sampled in the [`LoadReport`](crate::LoadReport).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BadRowPolicy {
+    /// Abort the load on the first malformed row.
+    #[default]
+    Fail,
+    /// Drop malformed rows, keeping the rest of the dataset.
+    Skip,
 }
 
-/// Validated kline timeframe; construction binds the expected bar interval.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct Timeframe {
-    raw: String,
-    interval_ms: i64,
-}
+impl BadRowPolicy {
+    /// Both policies, in documentation order.
+    pub const ALL: [Self; 2] = [Self::Fail, Self::Skip];
 
-impl Timeframe {
-    /// Parse and validate a Binance kline timeframe.
-    pub fn parse(s: impl AsRef<str>) -> Result<Self, ReaderError> {
-        let s = s.as_ref().trim();
-        if !is_supported(s) {
-            return Err(ReaderError::Config(format!(
-                "unsupported binance timeframe: {s}, valid values: {:?}",
-                supported_timeframes()
-            )));
+    /// Lowercase policy name used in config files and reports.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Fail => "fail",
+            Self::Skip => "skip",
         }
-        let interval_ms = interval_ms_for(s).ok_or_else(|| {
-            ReaderError::Config(format!("no interval defined for timeframe: {s}"))
-        })?;
-        Ok(Self {
-            raw: s.to_owned(),
-            interval_ms,
-        })
-    }
-
-    /// Borrow the raw timeframe string.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.raw
-    }
-
-    /// Configured bar interval in milliseconds.
-    #[must_use]
-    pub const fn interval_ms(&self) -> i64 {
-        self.interval_ms
     }
 }
 
-impl fmt::Display for Timeframe {
+impl fmt::Display for BadRowPolicy {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.raw)
+        f.write_str(self.as_str())
     }
 }
 
-impl AsRef<str> for Timeframe {
-    fn as_ref(&self) -> &str {
-        &self.raw
+impl FromStr for BadRowPolicy {
+    type Err = String;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        Self::ALL
+            .into_iter()
+            .find(|policy| policy.as_str() == raw)
+            .ok_or_else(|| format!("unsupported bad_rows policy: {raw}, valid values: fail, skip"))
     }
+}
+
+impl Serialize for BadRowPolicy {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for BadRowPolicy {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        raw.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+/// UTC midnight of `date` in epoch milliseconds.
+#[must_use]
+pub(crate) fn day_start_ms(date: NaiveDate) -> i64 {
+    date.and_hms_opt(0, 0, 0)
+        .map(|dt| dt.and_utc().timestamp_millis())
+        .unwrap_or(0)
+}
+
+/// UTC day index (`epoch_ms / 86_400_000`) for a non-negative timestamp.
+#[must_use]
+pub(crate) fn utc_day_index(timestamp_ms: i64) -> i64 {
+    timestamp_ms.div_euclid(86_400_000)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn date(year: i32, month: u32, day: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(year, month, day).unwrap()
+    }
+
     #[test]
-    fn dataset_roundtrip_and_display() {
-        for dataset in Dataset::ALL {
-            assert_eq!(dataset.as_str().parse::<Dataset>().unwrap(), dataset);
+    fn market_round_trips_and_accepts_aliases() {
+        for market in Market::ALL {
+            assert_eq!(market.as_path().parse::<Market>().unwrap(), market);
         }
-        assert!("Klines".parse::<Dataset>().is_err());
+        assert_eq!("um".parse::<Market>().unwrap(), Market::Um);
+        assert_eq!("cm".parse::<Market>().unwrap(), Market::Cm);
+        assert!("fapi".parse::<Market>().is_err());
+    }
+
+    #[test]
+    fn period_month_bounds_are_calendar_based() {
+        assert_eq!(
+            Period::Monthly.start_of(date(2024, 2, 15)),
+            date(2024, 2, 1)
+        );
+        assert_eq!(
+            Period::Monthly.next_start(date(2024, 1, 1)),
+            Some(date(2024, 2, 1))
+        );
+        assert_eq!(
+            Period::Monthly.next_start(date(2024, 2, 1)),
+            Some(date(2024, 3, 1))
+        );
+    }
+
+    #[test]
+    fn file_dates_parse_by_cadence() {
+        assert_eq!(
+            Period::Daily
+                .parse_file_date("BTCUSDT-1m-2024-01-02")
+                .unwrap()
+                .unwrap(),
+            date(2024, 1, 2)
+        );
+        assert_eq!(
+            Period::Monthly
+                .parse_file_date("BTCUSDT-fundingRate-2024-01")
+                .unwrap()
+                .unwrap(),
+            date(2024, 1, 1)
+        );
+        assert!(Period::Daily.parse_file_date("BTCUSDT-1m").is_none());
+        assert!(
+            Period::Daily
+                .parse_file_date("BTCUSDT-1m-2024-13-01")
+                .unwrap()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn interval_next_open_handles_calendar_months() {
+        let jan = day_start_ms(date(2024, 1, 1));
+        let feb = Interval::MO1.next_open(jan).unwrap();
+        assert_eq!(feb, day_start_ms(date(2024, 2, 1)));
+        assert_eq!(
+            Interval::MO1.next_open(feb).unwrap(),
+            day_start_ms(date(2024, 3, 1))
+        );
+        assert_eq!(
+            Interval::M1.next_open(jan).unwrap(),
+            jan + Interval::M1.step_ms().unwrap()
+        );
+    }
+
+    #[test]
+    fn interval_matrix_matches_downloader() {
+        assert!(Interval::S1.available_for(Market::Spot, Period::Daily));
+        assert!(Interval::S1.available_for(Market::Spot, Period::Monthly));
+        assert!(!Interval::S1.available_for(Market::Um, Period::Daily));
+        assert!(!Interval::S1.available_for(Market::Um, Period::Monthly));
+        assert!(Interval::D3.available_for(Market::Um, Period::Monthly));
+        assert!(!Interval::D3.available_for(Market::Um, Period::Daily));
+        assert!(!Interval::D3.available_for(Market::Spot, Period::Daily));
+        assert!(Interval::D3.available_for(Market::Spot, Period::Monthly));
     }
 
     #[test]
     fn dataset_support_matrix() {
-        assert!(Dataset::AggTrades.supports(Market::Spot));
-        assert!(Dataset::Metrics.supports(Market::Um));
-        assert!(!Dataset::Metrics.supports(Market::Spot));
-        assert!(Dataset::LiquidationSnapshot.supports(Market::Cm));
-        assert!(!Dataset::LiquidationSnapshot.supports(Market::Um));
+        assert!(Dataset::Klines.supports(Market::Spot, Period::Daily));
+        assert!(!Dataset::BookTicker.supports(Market::Spot, Period::Daily));
+        assert!(!Dataset::BookDepth.supports(Market::Um, Period::Monthly));
+        assert!(!Dataset::FundingRate.supports(Market::Um, Period::Daily));
+        assert!(Dataset::FundingRate.supports(Market::Um, Period::Monthly));
+        assert!(Dataset::LiquidationSnapshot.supports(Market::Cm, Period::Daily));
+        assert!(!Dataset::LiquidationSnapshot.supports(Market::Um, Period::Daily));
     }
 
     #[test]
-    fn index_symbol_is_underlying() {
-        let perp = Symbol::parse("BTCUSD_PERP").unwrap();
-        let quarterly = Symbol::parse("BTCUSDT_250926").unwrap();
-        let plain = Symbol::parse("BTCUSDT").unwrap();
-        assert_eq!(Dataset::IndexPriceKlines.storage_symbol(&perp), "BTCUSD");
+    fn index_storage_symbol_strips_contract_suffix() {
         assert_eq!(
-            Dataset::IndexPriceKlines.storage_symbol(&quarterly),
+            Dataset::IndexPriceKlines.storage_symbol("BTCUSD_PERP"),
+            "BTCUSD"
+        );
+        assert_eq!(
+            Dataset::IndexPriceKlines.storage_symbol("BTCUSDT_250926"),
             "BTCUSDT"
         );
-        assert_eq!(Dataset::IndexPriceKlines.storage_symbol(&plain), "BTCUSDT");
-        assert_eq!(Dataset::Trades.storage_symbol(&perp), "BTCUSD_PERP");
+        assert_eq!(Dataset::Klines.storage_symbol("BTCUSD_PERP"), "BTCUSD_PERP");
     }
 
     #[test]
-    fn interval_per_market() {
-        assert!(Interval::parse(Market::Spot, "1s").is_ok());
-        assert!(Interval::parse(Market::Um, "1s").is_err());
-        assert!(Interval::parse(Market::Um, "1mo").is_ok());
-        assert!(Interval::parse(Market::Cm, "4h").is_ok());
-        assert!(Interval::parse(Market::Um, "2d").is_err());
-    }
-
-    #[test]
-    fn symbol_rejects_empty() {
+    fn symbols_reject_path_and_case_errors() {
+        assert!(Symbol::parse("BTCUSDT").is_ok());
+        assert!(Symbol::parse("1000BONKUSDT").is_ok());
+        assert!(Symbol::parse("BTCUSD_PERP").is_ok());
+        assert!(Symbol::parse("btcusdt").is_err());
+        assert!(Symbol::parse("BTC-USDT").is_err());
+        assert!(Symbol::parse("../BTCUSDT").is_err());
+        assert!(Symbol::parse("12345").is_err());
         assert!(Symbol::parse("").is_err());
-        assert!(Symbol::parse("   ").is_err());
-        assert_eq!(Symbol::parse(" BTCUSDT ").unwrap().as_str(), "BTCUSDT");
     }
 
     #[test]
-    fn symbol_rejects_path_and_unsafe_characters() {
-        for invalid in [
-            "..",
-            "../BTCUSDT",
-            "BTC/USDT",
-            "BTC\\USDT",
-            "BTC USDT",
-            "BTC.USDT",
-            "_BTCUSDT",
-            "-BTCUSDT",
-            "BTCUSDT-",
-            "Ω",
-        ] {
-            assert!(Symbol::parse(invalid).is_err(), "accepted {invalid:?}");
+    fn bad_row_policy_round_trips() {
+        for policy in BadRowPolicy::ALL {
+            assert_eq!(policy.as_str().parse::<BadRowPolicy>().unwrap(), policy);
         }
     }
 
     #[test]
-    fn symbol_accepts_archive_shapes() {
-        for valid in [
-            "BTCUSDT",
-            "1000BONKUSDT",
-            "BTCUSD_PERP",
-            "BTCUSDT_250926",
-            "btcusdt",
-        ] {
-            assert_eq!(Symbol::parse(valid).unwrap().as_str(), valid);
-        }
-    }
-
-    #[test]
-    fn timeframe_accepts_binance_whitelist() {
-        assert!(Timeframe::parse("1m").is_ok());
-        assert!(Timeframe::parse("1d").is_ok());
-        assert_eq!(Timeframe::parse(" 4h ").unwrap().as_str(), "4h");
-        assert!(Timeframe::parse("D1").is_err());
-        assert!(Timeframe::parse("3d").is_err());
-    }
-
-    #[test]
-    fn timeframe_binds_interval() {
-        assert_eq!(Timeframe::parse("1m").unwrap().interval_ms(), 60_000);
-        assert_eq!(Timeframe::parse("1d").unwrap().interval_ms(), 86_400_000);
-        assert_eq!(interval_ms_for("1h"), Some(3_600_000));
-        assert_eq!(interval_ms_for("D1"), None);
-        assert!(supported_timeframes().contains(&"1d"));
+    fn day_index_is_floor_division_for_negative_values() {
+        assert_eq!(utc_day_index(0), 0);
+        assert_eq!(utc_day_index(86_399_999), 0);
+        assert_eq!(utc_day_index(86_400_000), 1);
+        assert_eq!(utc_day_index(-1), -1);
     }
 }

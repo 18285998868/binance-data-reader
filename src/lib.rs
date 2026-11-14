@@ -1,40 +1,79 @@
-//! Load Binance public-archive data into typed column vectors.
+//! Read Binance public archive data into typed columnar tables.
 //!
-//! Two loaders are exposed:
+//! The reader targets the tree produced by `binance-data-downloader`:
 //!
-//! - [`load_columns`] reads one symbol × one dataset (non-kline archive
-//!   families plus index/mark/premium klines) into [`DatasetColumns`].
-//! - [`load_kline_columns`] reads one symbol × one timeframe of regular klines
-//!   into [`KlineColumns`] (OHLCV).
+//! ```text
+//! {root}/data/{market}/{period}/{dataset}/{symbol}[/{interval}]/*.zip
+//! ```
 //!
-//! See the crate README for layout and configuration details.
+//! `root` is the downloader's `output_dir`, **not** its parent. `market` is
+//! `spot`, `futures/um` or `futures/cm`; `period` is `daily` or `monthly`.
+//!
+//! # What makes this reader strict
+//!
+//! - every `.zip` name must match the exact archive pattern;
+//! - every archive must contain exactly one CSV entry;
+//! - every row is validated against the schema and the calendar period of its
+//!   file;
+//! - klines must be strictly increasing with no duplicate open time and a
+//!   `close_time` matching the interval;
+//! - by default the first malformed row aborts the load
+//!   ([`BadRowPolicy::Fail`]); [`BadRowPolicy::Skip`] keeps the rest and
+//!   reports counts and samples.
+//!
+//! # Daily and monthly
+//!
+//! Both cadences are read. A daily file wins over a monthly file for the same
+//! UTC day; monthly rows outside daily coverage are kept. Merging is done by
+//! calendar cover, so multi-row datasets remain correct.
+//!
+//! # Output
+//!
+//! [`read`] returns a [`DatasetData`] with a [`Table`] of named typed columns
+//! and a [`LoadReport`]. Every archive field is preserved, including kline
+//! quote volume/count/taker fields, spot `is_best_match`, COIN-M `base_qty`
+//! and nullable metrics ratios.
+//!
+//! # Features
+//!
+//! - `python` (off by default): build the `binance_data_reader` extension
+//!   module with `read(config)` and `catalog(root, ...)`.
+//!
+//! # MSRV
+//!
+//! Rust 1.89, edition 2024.
+//!
+//! # Example
+//!
+//! ```no_run
+//! use binance_data_reader::{Config, Dataset, read};
+//!
+//! let config = Config::builder("/data/data/binance", Dataset::Klines, "BTCUSDT")
+//!     .interval("1m".parse()?)
+//!     .build()?;
+//! let data = read(&config)?;
+//! assert_eq!(data.table.len(), data.report.rows);
+//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! ```
 
-mod app;
+mod catalog;
 mod config;
+mod dataset;
 mod error;
-mod python;
-#[cfg(test)]
-#[path = "test_helpers.rs"]
-mod test_helpers;
+mod layout;
+mod load;
+mod report;
+mod source;
+mod table;
 mod types;
 
-pub use app::{
-    AggTradeColumns, BookDepthColumns, BookTickerColumns, DatasetColumns, FundingRateColumns,
-    KlineColumns, KlineDatasetColumns, LiquidationColumns, MetricsColumns, TradeColumns,
-    load_columns, load_kline_columns,
-};
-pub use config::{DataConfig, KlineConfig};
-pub use error::{ReaderError, Result};
-use pyo3::prelude::*;
-pub use types::{
-    Dataset, Interval, Market, Symbol, Timeframe, interval_ms_for, is_supported,
-    supported_timeframes,
-};
+#[cfg(feature = "python")]
+mod python;
 
-/// Python extension module (`maturin build` → `import binance_data_reader`).
-#[pymodule]
-fn binance_data_reader(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(python::py_load_columns, m)?)?;
-    m.add_function(wrap_pyfunction!(python::py_load_kline_columns, m)?)?;
-    Ok(())
-}
+pub use catalog::{Catalog, CatalogEntry, CatalogFilter, catalog};
+pub use config::{Config, ConfigBuilder};
+pub use error::{Error, Result};
+pub use load::{DatasetData, read};
+pub use report::LoadReport;
+pub use table::{Column, ColumnValues, Table};
+pub use types::{BadRowPolicy, Dataset, Interval, Market, Period, Symbol};

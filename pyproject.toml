@@ -4,9 +4,12 @@ build-backend = "maturin"
 
 [project]
 name = "binance-data-reader"
-version = "0.1.0"
+version = "0.2.0"
+description = "Read Binance public archive datasets into typed columnar tables."
 requires-python = ">=3.9"
+license = { text = "MIT" }
 
 [tool.maturin]
 bindings = "pyo3"
+features = ["python"]
 module-name = "binance_data_reader"

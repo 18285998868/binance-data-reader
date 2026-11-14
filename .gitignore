@@ -1,6 +1,8 @@
 /target
-/data
 /config.toml
-/config.test.toml
+/data
 /log
 /reports
+*.so
+__pycache__/
+.venv/
